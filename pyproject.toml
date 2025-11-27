@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goatpy"
+version = "0.0.1"
+description = "Spatial glycomics analysis toolkit using SpatialData and H&E-driven single-cell inference."
+authors = [
+  { name = "Andrew Causer" }
+]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+dependencies = [
+  "numpy>=2.2",
+  "pandas>=2.3",
+  "anndata>=0.11",
+  "spatialdata>=0.4",
+  "spatialdata-io>=0.3",
+  "tifffile>=2025.5",
+  "scanpy>=1.11",
+  "squidpy>=1.6"
+]
+
+[project.urls]
+homepage = "https://github.com/agc888/goatpy"
