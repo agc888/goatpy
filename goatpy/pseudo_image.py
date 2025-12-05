@@ -41,7 +41,9 @@ def Add_Pseudo_Image(sdata, image_ident, tables = "maldi_adata",library_id = "Sp
         if is_continous:
             binned_values = generate_continuous_bins(adata.obs[image_ident].to_numpy())
             adata.obs['image_bin'] = pd.Categorical(binned_values)
-            image_ident = 'image_bin'   
+            image_ident = 'image_bin' 
+            if cmap is None:
+                cmap = 'viridis'  
         else:
             adata.obs[image_ident] = adata.obs[image_ident].astype("category")
         adata.obsm["spatial"] = adata.obs[["x_coord","y_coord"]].to_numpy()
@@ -225,7 +227,7 @@ def create_image_from_data(coords_array, category_values, color_map):
 def he_spatialdata(he_image_path):
 
 
-    he_img = Image.open("/Users/andrewcauser/Documents/Griffith/res_check_0000.tif")
+    he_img = Image.open(he_image_path)
 
     img = np.array(he_img) 
 

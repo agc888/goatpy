@@ -9,7 +9,8 @@ from anndata import AnnData
 from spatialdata import SpatialData
 from spatialdata.models import PointsModel, Image2DModel, TableModel
 from spatialdata.transformations import Identity
-import importlib.resources
+import pkg_resources
+import os
 
 
 
@@ -56,8 +57,14 @@ def rd_peaks(fn):
 
 
 def rd_peaks_from_package():
-    # 'data' is the folder inside goatpy, 'peaks.csv' is your file
-    with importlib.resources.open_text("goatpy.data", "PEAKS.csv") as f:
+
+    # Try to get the file from the package
+    peaks_path = pkg_resources.resource_filename('goatpy', 'data/PEAKS.csv')
+    
+    if not os.path.exists(peaks_path):
+        raise FileNotFoundError(f"PEAKS.csv not found at {peaks_path}")
+    
+    with open(peaks_path, 'r') as f:
         data = []
         f.readline()  # skip header
         for line in f:
@@ -89,14 +96,22 @@ def glyco_spatialdata(imzml_path, peaks_path = None):
     coords = np.array(p.coordinates)[:, :2]  # (x, y)
     coords = coords - 1  # convert from 1-based to 0-based indexing
     
+
+
+
     # Create AnnData Object
     spectra_flat = np.array([spectra_all[y-1, x-1, :] for x, y in coords])
     anndata = ad.AnnData(spectra_flat, dtype=np.float32)
     anndata.var_names = np.array(["%.1f" % p for p in peaks])
     anndata.obs_names = np.array(list(map(str, range(len(coords)))))
-    anndata.obs["x"] = coords[:, 0]
-    anndata.obs["y"] = coords[:, 1]
-    anndata.obsm["spatial"] = coords[:, :2]
+    anndata.obs["full_x"] = coords[:, 0]
+    anndata.obs["full_y"] = coords[:, 1]
+
+    anndata.obs["x"] = anndata.obs["full_x"] - anndata.obs["full_x"].min() 
+    anndata.obs["y"] = anndata.obs["full_y"] - anndata.obs["full_y"].min()
+    
+    anndata.obsm["spatial"] = np.column_stack([anndata.obs["x"], anndata.obs["y"]])
+
 
     # Calculate Total Ion Count (TIC)
     anndata.obs["TIC"] = np.ravel(anndata.X.sum(axis=1))
