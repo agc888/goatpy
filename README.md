@@ -8,3 +8,14 @@ To install goatpy please follow the instructions for creating a conda enviornemn
 ```
 conda env create -f environment.yml
 ```
+
+Once created we can activate the environment:
+
+```
+conda activate myenv
+```
+And install goatpy
+
+```
+pip install git+https://github.com/agc888/goatpy.git
+```
