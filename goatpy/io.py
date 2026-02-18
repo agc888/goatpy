@@ -4,10 +4,12 @@ from joblib import Parallel, delayed
 from functools import partial
 import anndata as ad
 import pandas as pd
+import geopandas as gpd
+from shapely.geometry import box
 import numpy as np
 from anndata import AnnData
 from spatialdata import SpatialData
-from spatialdata.models import PointsModel, Image2DModel, TableModel
+from spatialdata.models import PointsModel, Image2DModel, TableModel, ShapesModel
 from spatialdata.transformations import Identity
 import pkg_resources
 import os
@@ -75,7 +77,7 @@ def rd_peaks_from_package():
     return data
 
 
-def glyco_spatialdata(imzml_path, peaks_path = None):
+def glyco_spatialdata(imzml_path, peaks_path = None, pixel_size = 20):
 
     # Load Peaks
     if peaks_path is None:
@@ -97,8 +99,6 @@ def glyco_spatialdata(imzml_path, peaks_path = None):
     coords = coords - 1  # convert from 1-based to 0-based indexing
     
 
-
-
     # Create AnnData Object
     spectra_flat = np.array([spectra_all[y-1, x-1, :] for x, y in coords])
     anndata = ad.AnnData(spectra_flat, dtype=np.float32)
@@ -110,11 +110,12 @@ def glyco_spatialdata(imzml_path, peaks_path = None):
     anndata.obs["x"] = anndata.obs["full_x"] - anndata.obs["full_x"].min() 
     anndata.obs["y"] = anndata.obs["full_y"] - anndata.obs["full_y"].min()
     
+
     anndata.obsm["spatial"] = np.column_stack([anndata.obs["x"], anndata.obs["y"]])
 
 
     # Calculate Total Ion Count (TIC)
-    anndata.obs["TIC"] = np.ravel(anndata.X.sum(axis=1))
+    anndata.obs["MPI"] = np.ravel(anndata.X.sum(axis=1))
 
     
     # Create SpatialData Object
@@ -123,8 +124,8 @@ def glyco_spatialdata(imzml_path, peaks_path = None):
         "y": [c for c in anndata.obs["y"]],
     })
 
-    coords["point_id"] = coords.index.astype(str)      # unique ID for each pixel
-    coords["region"] = "maldi_pixels"                  # must exist for TableModel
+    coords["instance_id"] = coords.index.astype(str)      # unique ID for each pixel
+    coords["region"] = "pixels"                  # must exist for TableModel
 
     df = pd.concat(
         [
@@ -136,7 +137,18 @@ def glyco_spatialdata(imzml_path, peaks_path = None):
 
     
     points = PointsModel.parse(df)
-    sdata = SpatialData(points={"maldi_pixels": points})
+
+    gdf = centroids_to_pixel_squares(df, x_col="x", y_col="y", pixel_size=1.0)  
+    
+    shapes = ShapesModel.parse(
+                gdf[["instance_id", "geometry"]],
+                transformations={"global": Identity()},
+                )
+
+
+    sdata = SpatialData(points={"centroids": points},
+                        shapes={"pixels": shapes})
+
 
     adata = AnnData(
         X=anndata.X,
@@ -155,12 +167,17 @@ def glyco_spatialdata(imzml_path, peaks_path = None):
     coords = np.array(adata.obs[["x", "y"]])
 
     adata.obsm["spatial"] = coords
+    adata.obs["instance_id"] = sdata["pixels"].index
+    adata.obs["region"] = "pixels"
+    adata.obs["region"].astype("category")
+
+
 
     table = TableModel.parse(
         adata,
-        region="maldi_pixels",      # name of your PointsModel
+        region="pixels",      # name of your PointsModel
         region_key="region",        # must exist in adata.obs
-        instance_key="point_id"     # unique per row
+        instance_key="instance_id"     # unique per row
     )
 
     # --- 7. Add to SpatialData ---
@@ -169,5 +186,19 @@ def glyco_spatialdata(imzml_path, peaks_path = None):
     return sdata
 
 
-
+def centroids_to_pixel_squares(df, x_col="x", y_col="y", pixel_size=1.0):
+    
+    half = pixel_size / 2
+    
+    geometries = [
+        box(x - half, y - half, x + half, y + half)
+        for x, y in zip(df[x_col], df[y_col])
+    ]
+    
+    gdf = gpd.GeoDataFrame(
+        df.copy(),
+        geometry=geometries,
+    )
+    
+    return gdf
 

@@ -3,8 +3,9 @@ import numpy as np
 import scanpy as sc
 from anndata import AnnData
 from spatialdata import SpatialData
-from spatialdata.models import PointsModel, Image2DModel, TableModel
+from spatialdata.models import PointsModel, Image2DModel, TableModel, ShapesModel
 from spatialdata.transformations import Identity
+from shapely.affinity import scale as shapely_scale
 
 from PIL import Image
 from PIL.ExifTags import TAGS
@@ -31,7 +32,7 @@ from spatialdata.transformations import Affine, Scale, Sequence as SequenceTrans
 import matplotlib.pyplot as plt
 
 
-def Add_Pseudo_Image(sdata, image_ident, tables = "maldi_adata",library_id = "Spatial", convert_to_int = True, cmap = None, is_continous = False):
+def Add_Pseudo_Image(sdata, image_ident, tables = "maldi_adata",library_id = "Spatial", convert_to_int = True, cmap = None, is_continous = False, img_upscaling = 1):
     
     adata = sdata.tables[tables]
 
@@ -48,10 +49,49 @@ def Add_Pseudo_Image(sdata, image_ident, tables = "maldi_adata",library_id = "Sp
             adata.obs[image_ident] = adata.obs[image_ident].astype("category")
         adata.obsm["spatial"] = adata.obs[["x_coord","y_coord"]].to_numpy()
         adata.obsm["spatial"] = adata.obsm["spatial"].astype(float)
-        adata = add_uns(adata,image_ident, library_id, cmap = cmap)
+        adata = add_uns(adata,image_ident, library_id, cmap = cmap, img_upscaling = img_upscaling)
     else:
         raise KeyError("The required columns 'x' and 'y' are missing from the adata.obs slot!")
         
+    adata.obsm["spatial"] = adata.obsm["spatial"]* img_upscaling
+    # --------------------------------------------------
+    # Update SpatialData Points coordinates
+    # --------------------------------------------------
+    if 'centroids' in sdata.points:
+        
+        # Extract existing points dataframe
+        points_df = sdata.points['centroids'].copy()
+
+        # Multiply spatial columns
+        if 'x' in points_df.columns:
+            points_df['x'] = points_df['x'] * img_upscaling
+        if 'y' in points_df.columns:
+            points_df['y'] = points_df['y'] * img_upscaling
+
+        # Re-parse into PointsModel to preserve coordinate system
+        scaled_points = PointsModel.parse(
+            points_df
+        )
+
+        # Replace in SpatialData
+        sdata.points['centroids'] = scaled_points
+
+
+    if 'pixels' in sdata.shapes:
+        
+        # Extract existing shapes GeoDataFrame
+        shapes_gdf = sdata.shapes['pixels'].copy()
+        
+        # Scale all geometries
+        shapes_gdf['geometry'] = shapes_gdf['geometry'].apply(
+            lambda geom: shapely_scale(geom, xfact=img_upscaling, yfact=img_upscaling, origin=(0, 0))
+        )
+        
+        # Re-parse into ShapesModel to preserve coordinate system
+        scaled_shapes = ShapesModel.parse(shapes_gdf)
+        
+        # Replace in SpatialData
+        sdata.shapes['pixels'] = scaled_shapes
 
     ig = adata.uns["spatial"][library_id]["images"]["hires"]
 
@@ -83,7 +123,7 @@ def Add_Pseudo_Image(sdata, image_ident, tables = "maldi_adata",library_id = "Sp
 
     return(sdata)
 
-def add_uns(adata,ident, library_id, cmap = None, data_type = "categorical"):
+def add_uns(adata,ident, library_id, cmap = None, data_type = "categorical", img_upscaling = 1):
     
     unique_categories = np.unique(adata.obs[ident])
     if cmap is None:
@@ -96,6 +136,8 @@ def add_uns(adata,ident, library_id, cmap = None, data_type = "categorical"):
         color_map = cmap
         
     image = create_image_from_data(adata.obsm["spatial"], adata.obs[ident], color_map)
+    image = image.resize((image.width * img_upscaling, image.height * img_upscaling), Image.NEAREST)
+
     imgarr = np.array(image)
 
     
@@ -111,7 +153,7 @@ def add_uns(adata,ident, library_id, cmap = None, data_type = "categorical"):
     ] = 1.0
     adata.uns["spatial"][library_id]["scalefactors"][
         "spot_diameter_fullres"
-    ] = 15
+    ] = img_upscaling
     return adata
 
 def generate_random_colors(categories):

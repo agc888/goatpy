@@ -12,13 +12,13 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtCore import Qt
 
-
 from spatialdata.transformations import (
     align_elements_using_landmarks,
     get_transformation_between_landmarks,
 )
 
 from spatialdata.transformations import (
+    Identity,
     BaseTransformation,
     Sequence,
     get_transformation,
@@ -79,6 +79,21 @@ def align_image_using_landmarks(
         source_coordinate_system="global",
         target_coordinate_system="aligned",
     )
+
+    for _, _, element in maldi_sd._gen_elements():
+        transforms = get_transformation(element, get_all=True)
+        if "global" not in transforms:
+            set_transformation(element, Identity(), "global")
+
+
+    postpone_transformation(
+        sdata=maldi_sd,
+        transformation=Identity(),
+        source_coordinate_system="global",
+        target_coordinate_system="aligned",
+    )
+
+
 
     he_image = he_sd.images[he_image_key]
     maldi_sd.images[he_image_key] = he_image
@@ -271,7 +286,7 @@ class LandmarkAlignmentWidget(QWidget):
         self.viewer.add_image(
             maldi_data,
             name="MALDI",
-            colormap="gray"
+            colormap="viridis"
         )
         
         # Add H&E image
@@ -321,7 +336,7 @@ class LandmarkAlignmentWidget(QWidget):
         self.maldi_viewer.add_image(
             maldi_data,
             name="MALDI",
-            colormap="gray"
+            colormap="viridis"
         )
         
         self.maldi_points_layer = self.maldi_viewer.add_points(
