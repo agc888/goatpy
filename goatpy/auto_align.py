@@ -1,321 +1,765 @@
-from PIL import Image
+"""
+auto_align.py
+=============
+Auto-registration of a MALDI imzML dataset against a whole-slide H&E image.
+
+Key design decisions
+--------------------
+1.  Registration is performed at MALDI native pixel size (default 10 µm/px)
+    so the H&E thumbnail is tiny (~16 MB) and peak RAM stays under 300 MB.
+
+2.  Matching uses raw normalised grayscale cross-correlation (TM_CCOEFF_NORMED)
+    on the TIC image vs inverted H&E intensity.  No binary thresholding is
+    needed — NCC handles intensity scale differences automatically and is more
+    discriminative than binary template matching.
+
+3.  The output SpatialData is CROPPED to the MALDI region (plus padding).
+    Storing the entire whole-slide H&E is unnecessary and makes visualisation
+    confusing.  The returned H&E image shows only the tissue area covered by
+    the MALDI scan, at the registration resolution.
+
+4.  A two-pass rotation search (coarse 0–360°, then fine) finds the correct
+    slide orientation without assuming any starting angle.
+"""
+
+from __future__ import annotations
+
+import os
+import gc
+from functools import partial
+from typing import Optional
+
 import numpy as np
 import pandas as pd
-from functools import partial
+import anndata as ad
+import geopandas as gpd
+import cv2 as cv
+from PIL import Image
+from scipy.ndimage import uniform_filter
+from shapely.geometry import box
 
 from spatialdata import SpatialData
-from spatialdata.models import PointsModel, Image2DModel, TableModel, ShapesModel
+from spatialdata.models import Image2DModel, PointsModel, ShapesModel, TableModel
 from spatialdata.transformations import Identity
-from shapely.geometry import box
-import geopandas as gpd
 
-from .io import *
-from .registration import *
+from .io import parmap, getimage, rd_peaks, rd_peaks_from_package
+from pyimzml.ImzMLParser import ImzMLParser
 
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-def get_crop(img, cutoff=0.1):
-    sm = np.sum(img, axis=0)
-    #print("HELLO", sm)
-    mr = max(np.where(sm<cutoff)[0])
-    sm = np.sum(img, axis=1)
-    #print("HI", sm)
-    mc = max(np.where(sm<cutoff)[0])
-    return mr, mc
+def _log(msg: str) -> None:
+    try:
+        import psutil
+        rss = psutil.Process(os.getpid()).memory_info().rss / 1e9
+        print(f"[{rss:.2f}GB] {msg}")
+    except ImportError:
+        print(msg)
 
 
+# ---------------------------------------------------------------------------
+# H&E loading
+# ---------------------------------------------------------------------------
 
-def normalize_maldi_img(maldi_img, mask=None, scale=False):
-    #return maldi_img
-    from scipy.ndimage import convolve
-    import matplotlib.pyplot as plt
-    kernel = np.ones((40, 40))    
-    #fig, ax = plt.subplots(1,3, figsize=(10,30))
-    #ax[0].matshow(maldi_img)
+def _read_native_mpp(he_path: str) -> Optional[float]:
+    """Read native microns-per-pixel from file metadata without loading pixels."""
+    try:
+        import openslide
+        slide = openslide.OpenSlide(he_path)
+        mpp_x = slide.properties.get(openslide.PROPERTY_NAME_MPP_X)
+        mpp_y = slide.properties.get(openslide.PROPERTY_NAME_MPP_Y)
+        slide.close()
+        if mpp_x and mpp_y:
+            return (float(mpp_x) + float(mpp_y)) / 2.0
+    except Exception:
+        pass
+    return None
 
-    if mask is not None:
-        sumval = convolve(maldi_img*mask.astype(np.float32) , kernel, mode='reflect')
-        normval = convolve(mask.astype(np.float32), kernel, mode='reflect')
-        mean = sumval/normval
-        
-        #plt.matshow(normval)
-        #plt.colorbar()
-        #plt.show()
+
+def _load_he_at_resolution(he_path: str,
+                            target_mpp: float,
+                            native_mpp: float) -> tuple[Image.Image, float]:
+    """
+    Load H&E at (or just finer than) target_mpp using openslide pyramid
+    selection, then resize to exactly target_mpp.
+    """
+    ext = os.path.splitext(he_path)[1].lower()
+    wsi_exts = {'.svs', '.ndpi', '.scn', '.czi', '.mrxs'}
+
+    try:
+        import openslide
+        slide = openslide.OpenSlide(he_path)
+
+        best_level = 0
+        best_mpp   = native_mpp
+        for lvl in range(slide.level_count):
+            lvl_mpp = native_mpp * slide.level_downsamples[lvl]
+            if lvl_mpp <= target_mpp * 1.05:
+                best_level = lvl
+                best_mpp   = lvl_mpp
+
+        dims   = slide.level_dimensions[best_level]
+        region = slide.read_region((0, 0), best_level, dims)
+        img    = region.convert('RGB')
+        slide.close()
+        _log(f"  openslide level {best_level}: {dims[0]}×{dims[1]}  "
+             f"{best_mpp:.3f} µm/px  ({img.width*img.height*3/1e6:.0f} MB)")
+
+        if abs(best_mpp - target_mpp) / target_mpp > 0.02:
+            scale = best_mpp / target_mpp
+            nw    = max(1, round(img.width  * scale))
+            nh    = max(1, round(img.height * scale))
+            img   = img.resize((nw, nh), Image.Resampling.LANCZOS)
+            best_mpp = target_mpp
+            _log(f"  Resized to {nw}×{nh}  {target_mpp:.3f} µm/px")
+
+        return img, best_mpp
+
+    except Exception as e:
+        if ext in wsi_exts:
+            raise RuntimeError(
+                f"\nFailed to open '{he_path}' with openslide: {e}\n\n"
+                "SVS/NDPI files require openslide:\n"
+                "  conda install -c conda-forge openslide openslide-python\n"
+                "  brew install openslide  (macOS)\n"
+            ) from e
+
+    img = Image.open(he_path).convert('RGB')
+    _log(f"  PIL: {img.width}×{img.height}")
+    scale = native_mpp / target_mpp
+    nw    = max(1, round(img.width  * scale))
+    nh    = max(1, round(img.height * scale))
+    img   = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    _log(f"  Resized to {nw}×{nh}  {target_mpp:.3f} µm/px  ({nw*nh*3/1e6:.0f} MB)")
+    return img, target_mpp
+
+
+# ---------------------------------------------------------------------------
+# MALDI loading
+# ---------------------------------------------------------------------------
+
+def _load_spectra(imzml_path: str,
+                  peaks: list[float],
+                  chunk_size: int = 10,
+                  crop_r: int = 0,
+                  crop_c: int = 0) -> np.ndarray:
+    from pyimzml.ImzMLParser import getionimage
+    p0    = ImzMLParser(imzml_path)
+    probe = getionimage(p0, peaks[0], tol=0.1, reduce_func=max)
+    h     = probe.shape[0] - crop_r
+    w     = probe.shape[1] - crop_c
+    del probe
+
+    out = np.zeros((h, w, len(peaks)), dtype=np.float32)
+    for start in range(0, len(peaks), chunk_size):
+        batch = peaks[start: start + chunk_size]
+        imgs  = parmap(partial(getimage, path=imzml_path), batch,
+                       nprocs=min(len(batch), 4))
+        for j, img in enumerate(imgs):
+            out[:, :, start + j] = img[crop_r:, crop_c:]
+        del imgs
+        _log(f"  Peaks {start+1}–{min(start+len(batch), len(peaks))} / {len(peaks)}")
+    return out
+
+
+def _read_maldi_pixel_size(imzml_path: str) -> Optional[float]:
+    """
+    Read the pixel size in µm from imzML scan settings metadata.
+    Returns None if not found.
+    """
+    try:
+        p = ImzMLParser(imzml_path)
+        for key in ['pixel size (x)', 'pixel size x', 'pixel size']:
+            val = p.imzmldict.get(key)
+            if val is not None:
+                return float(val)
+    except Exception:
+        pass
+    return None
+
+
+def _crop_offsets(spectra_sum: np.ndarray, cutoff: float = 0.5) -> tuple[int, int]:
+    try:
+        crop_c = int(max(np.where(np.sum(spectra_sum, axis=0) < cutoff)[0]))
+        crop_r = int(max(np.where(np.sum(spectra_sum, axis=1) < cutoff)[0]))
+        return crop_r, crop_c
+    except (ValueError, IndexError):
+        return 0, 0
+
+
+# ---------------------------------------------------------------------------
+# Image preparation — grayscale normalised for NCC
+# ---------------------------------------------------------------------------
+
+def _maldi_to_grayscale(tic: np.ndarray) -> np.ndarray:
+    """
+    Convert MALDI TIC to a float32 grayscale image normalised to [0, 1].
+
+    Applies a light Gaussian blur to smooth single-pixel noise, then
+    normalises so bright regions (high TIC = tissue) map to values near 1.
+    """
+    blurred = cv.GaussianBlur(tic, (3, 3), 0)
+    mn, mx  = blurred.min(), blurred.max()
+    if mx > mn:
+        norm = (blurred - mn) / (mx - mn)
     else:
-        mean = convolve(maldi_img, kernel, mode='reflect')/kernel.size
-    if scale:
-        squared_diff = (maldi_img - mean)**2
-        std = np.sqrt(convolve(squared_diff, kernel, mode='reflect')/kernel.size)
-        maldi_img = (maldi_img-mean)/std
+        norm = blurred * 0.0
+    _log(f"  MALDI grayscale: {norm.shape}  "
+         f"mean={norm.mean():.3f}  nonzero={np.count_nonzero(norm)/norm.size:.1%}")
+    return norm.astype(np.float32)
+
+
+def _he_to_grayscale(he_img: Image.Image) -> np.ndarray:
+    """
+    Convert H&E to a float32 grayscale image normalised to [0, 1].
+
+    H&E tissue stains dark (low pixel values) while glass background is
+    bright.  Inverting means tissue → high values, matching MALDI convention
+    where tissue has high TIC.  This lets TM_CCOEFF_NORMED directly compare
+    the two without any binarisation threshold choice.
+    """
+    gray = np.array(he_img.convert('L'), dtype=np.float32)
+    inv  = 255.0 - gray
+    mn, mx = inv.min(), inv.max()
+    if mx > mn:
+        norm = (inv - mn) / (mx - mn)
     else:
-        maldi_img = maldi_img - mean
+        norm = inv * 0.0
+    _log(f"  H&E grayscale: {norm.shape}  "
+         f"mean={norm.mean():.3f}  nonzero={np.count_nonzero(norm)/norm.size:.1%}")
+    return norm.astype(np.float32)
 
 
-    #ax[1].matshow(np.clip(maldi_img, 0, None))
-    #ax[2].matshow(mean)
-    #plt.colorbar()
-    #plt.show()
-    return maldi_img
+# ---------------------------------------------------------------------------
+# Registration — two-pass rotation + translation
+# ---------------------------------------------------------------------------
+
+def _match_at_rotation(he_gray: np.ndarray,
+                        maldi_gray: np.ndarray,
+                        rotation: float,
+                        canvas_shape: tuple[int, int]) -> tuple[float, tuple[int, int]]:
+    """
+    Rotate H&E, place centred in canvas, run NCC template match.
+    Returns (score, (row, col)) where (row, col) is the top-left of the
+    MALDI template in the canvas coordinate system.
+    """
+    he_pil  = Image.fromarray((he_gray * 255).astype(np.uint8))
+    rot_pil = he_pil.rotate(rotation, expand=True, resample=Image.Resampling.BILINEAR)
+    rot_arr = np.array(rot_pil, dtype=np.float32) / 255.0
+
+    rh, rw = rot_arr.shape
+    canvas = np.zeros(canvas_shape, dtype=np.float32)
+    pr     = max(0, (canvas_shape[0] - rh) // 2)
+    pc     = max(0, (canvas_shape[1] - rw) // 2)
+    use_h  = min(rh, canvas_shape[0] - pr)
+    use_w  = min(rw, canvas_shape[1] - pc)
+    canvas[pr: pr + use_h, pc: pc + use_w] = rot_arr[:use_h, :use_w]
+
+    # Guard: matchTemplate requires canvas >= template in both dimensions
+    if canvas.shape[0] < maldi_gray.shape[0] or canvas.shape[1] < maldi_gray.shape[1]:
+        raise ValueError(
+            f"H&E canvas ({canvas.shape[1]}×{canvas.shape[0]} px) is smaller than "
+            f"MALDI template ({maldi_gray.shape[1]}×{maldi_gray.shape[0]} px) at "
+            f"the current registration resolution.\n"
+            f"This usually means maldi_pixel_um is too large.\n"
+            f"Try passing maldi_pixel_um=10 or maldi_pixel_um=20 explicitly."
+        )
+    result           = cv.matchTemplate(canvas, maldi_gray, cv.TM_CCOEFF_NORMED)
+    _, score, _, loc = cv.minMaxLoc(result)
+
+    return float(score), (int(loc[1]), int(loc[0]))   # (row, col)
 
 
-def generate_MPI_img(shp, adata):
-    cluster_label = adata.obs['MPI'].to_numpy().astype(np.int32)
-    cluster_id = adata.obs.index.to_numpy().astype(np.int32)
-    print(cluster_label.shape)
+def _register(he_gray: np.ndarray,
+              maldi_gray: np.ndarray,
+              coarse_step: int = 15,
+              fine_range: float = 5.0,
+              fine_step: float = 1.0,
+              buffer_px: int = 150) -> tuple[float, tuple[int, int]]:
+    """
+    Two-pass rotation + translation search using normalised cross-correlation.
 
-    cluster_img = np.zeros((shp[0], shp[1]), dtype=np.int32)
+    Returns
+    -------
+    rotation : float — degrees to rotate H&E (PIL CCW convention)
+    offset   : (row, col) — top-left of MALDI in the rotated+centred canvas
+    """
+    canvas_h     = he_gray.shape[0] + buffer_px
+    canvas_w     = he_gray.shape[1] + buffer_px
+    canvas_shape = (canvas_h, canvas_w)
 
-    for k,v in zip(map(int, cluster_id), cluster_label):
-        idx = np.unravel_index(k, (shp[0], shp[1]))
-        cluster_img[idx[0], idx[1]] = v+1
-    return cluster_img
+    # Coarse pass: full 0–360°
+    coarse_rots = list(range(0, 360, coarse_step))
+    _log(f"  Coarse: {len(coarse_rots)} rotations (0–360° step {coarse_step}°) …")
+
+    best_score = -np.inf
+    best_rot   = 0.0
+    best_idx   = (0, 0)
+
+    for rot in coarse_rots:
+        score, idx = _match_at_rotation(he_gray, maldi_gray, rot, canvas_shape)
+        _log(f"    {rot:5.1f}°  score={score:.4f}")
+        if score > best_score:
+            best_score, best_rot, best_idx = score, float(rot), idx
+
+    _log(f"  Best coarse: {best_rot}°  score={best_score:.4f}")
+
+    # Fine pass: around best coarse angle
+    fine_rots = sorted({
+        round(best_rot + d, 1)
+        for d in np.arange(-fine_range, fine_range + fine_step, fine_step)
+        if abs(d) > 1e-6
+    })
+    _log(f"  Fine: {len(fine_rots)} rotations (±{fine_range}° step {fine_step}°) …")
+
+    for rot in fine_rots:
+        score, idx = _match_at_rotation(he_gray, maldi_gray, rot, canvas_shape)
+        _log(f"    {rot:5.1f}°  score={score:.4f}")
+        if score > best_score:
+            best_score, best_rot, best_idx = score, rot, idx
+
+    _log(f"  Final: {best_rot}°  score={best_score:.4f}  offset={best_idx}")
+    return best_rot, best_idx
 
 
-def load_and_align(imzml_path, 
-                   he_path,
-                   extra_img_path = None,
-                   peaks_path = None, 
-                   target_resolution = 0.5, 
-                   maldi_pixel_size = 10,
-                   maldi_threshold = 1,
-                   sparsity = 0.3,
-                   he_pixel_size = 0.2527,
-                   he_threshold = 200,
-                   f_pixel_size = 0.5,
-                   f_threshold = 50,
-                   buffer = 2000
-                   ):
+# ---------------------------------------------------------------------------
+# Output: crop H&E to MALDI region
+# ---------------------------------------------------------------------------
+
+def _build_full_output(he_img: Image.Image,
+                        rotation: float,
+                        buffer_px: int,
+                        ) -> tuple[np.ndarray, tuple[int, int]]:
+    """
+    Rotate the H&E thumbnail and place it in a canvas (no cropping).
+
+    Returns
+    -------
+    canvas_rgb  : np.ndarray (H, W, 3) uint8  — full rotated H&E
+    canvas_pad  : (pad_r, pad_c)  — pixels of zero-padding added before
+                  the rotated image, so MALDI offsets from matchTemplate
+                  map directly into this canvas without adjustment.
+    """
+    canvas_h = he_img.height + buffer_px
+    canvas_w = he_img.width  + buffer_px
+
+    he_rot  = he_img.rotate(rotation, expand=True, resample=Image.Resampling.BILINEAR)
+    rh, rw  = he_rot.height, he_rot.width
+    pr      = max(0, (canvas_h - rh) // 2)
+    pc      = max(0, (canvas_w - rw) // 2)
+    use_h   = min(rh, canvas_h - pr)
+    use_w   = min(rw, canvas_w - pc)
+
+    canvas  = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    rot_arr = np.array(he_rot, dtype=np.uint8)
+    canvas[pr: pr + use_h, pc: pc + use_w] = rot_arr[:use_h, :use_w]
+    del he_rot, rot_arr
+
+    _log(f"  H&E canvas (full): {canvas_w}×{canvas_h}  ({canvas.nbytes/1e6:.0f} MB)")
+    return canvas, (0, 0)   # crop_origin = (0,0) — no crop applied
 
 
-    scale_factor = int(maldi_pixel_size/target_resolution) #integer may be critical here
-    he_ratio=target_resolution/he_pixel_size
-    f_ratio = target_resolution/f_pixel_size
+# ---------------------------------------------------------------------------
+# SpatialData construction
+# ---------------------------------------------------------------------------
 
-    # Load Peaks
-    if peaks_path is None:
-        peaks = rd_peaks_from_package()
-    else:
-        peaks = rd_peaks(peaks_path)
+def _build_spatialdata(spectra_all: np.ndarray,
+                       peaks: list[float],
+                       maldi_pixel_um: float,
+                       he_canvas: np.ndarray,
+                       maldi_offset_in_canvas: tuple[int, int],
+                       reg_mpp: float,
+                       crop_r: int,
+                       crop_c: int,
+                       img_upscaling: int = 10,
+                       library_id: str = "spatial") -> SpatialData:
+    """
+    Assemble SpatialData.
 
-    # Load ImzML data
-    getimg = partial(getimage, path=imzml_path)
+    The H&E image and all coordinates are upscaled by `img_upscaling` so
+    that each MALDI pixel covers img_upscaling × img_upscaling canvas pixels.
+    This exactly mirrors what Add_Pseudo_Image does and is required for napari
+    to render spots at a visible size — without upscaling, every spot is 1px
+    and renders as a triangle artefact.
 
-    spectra_all = np.stack(
-        parmap(getimg, peaks, 10),
-        axis=-1
+    adata.uns["spatial"] is populated with the same structure that
+    Add_Pseudo_Image writes, including spot_diameter_fullres = img_upscaling,
+    so napari-spatialdata knows the correct display size immediately.
+    """
+    maldi_h, maldi_w, n_peaks = spectra_all.shape
+
+    # scale (always ~1.0 since H&E is loaded at maldi_pixel_um resolution)
+    scale = maldi_pixel_um / reg_mpp
+
+    # maldi_offset_in_canvas is already in canvas coordinates — use directly
+    local_off_r, local_off_c = maldi_offset_in_canvas
+
+    # Upscale the H&E image so each MALDI pixel covers img_upscaling px
+    us = img_upscaling
+    he_up_h = he_canvas.shape[0] * us
+    he_up_w = he_canvas.shape[1] * us
+    he_up = np.array(
+        Image.fromarray(he_canvas).resize(
+            (he_up_w, he_up_h), Image.Resampling.NEAREST
+        ),
+        dtype=np.uint8,
     )
+    _log(f"  H&E upscaled {us}×: {he_up_w}×{he_up_h}  ({he_up.nbytes/1e6:.0f} MB)")
 
-    p = ImzMLParser(imzml_path)
+    # All spatial coordinates are multiplied by us to match upscaled image
+    grid_r, grid_c = np.mgrid[0: maldi_h, 0: maldi_w]
+    he_r = ((local_off_r + (grid_r.flatten() + 0.5) * scale) * us)
+    he_c = ((local_off_c + (grid_c.flatten() + 0.5) * scale) * us)
 
+    # --- AnnData ---
+    adata = ad.AnnData(
+        spectra_all.reshape(-1, n_peaks).copy(),
+        dtype=np.float32,
+    )
+    adata.var_names = np.array(["%.1f" % pk for pk in peaks])
+    adata.obs_names = np.array([str(i) for i in range(maldi_h * maldi_w)])
 
-    ave_spec = {}
-    TIC = np.zeros((p.imzmldict['max count of pixels y'], p.imzmldict['max count of pixels x']))
-    ave_spec['mean_spectrum'] = np.zeros_like(p.getspectrum(0)[1])
-    ave_spec['mzs'] = p.getspectrum(0)[0]
-    count = 0
-
-    #matrix_peak = getimage(1289.15)
-    for idx, (x,y,z) in enumerate(p.coordinates):
-        mzs, spectrum = p.getspectrum(idx)
-        TIC[y-1,x-1] = np.sum(spectrum)
-        if TIC[y-1,x-1]>0: # and matrix_peak[y-1,x-1]<0.3:
-            #ave_spec['mean_spectrum'] += spectrum #Aligned spectrum can't show
-            count+=1
-            
-    ave_spec['mean_spectrum'] = np.zeros_like(ave_spec['mzs'])
-
-    maldi_img = np.nansum(spectra_all, axis=-1)
-    try: 
-        mr, mc = get_crop(maldi_img, cutoff=0.5) #cells
-    except ValueError: #None below threshold
-        mr, mc = 0, 0
-
-    maldi_img = maldi_img[mc:, mr:]
-    spectra_all = spectra_all[mc:,mr:,:]
-
-    ### Load Images
-
-    maldi_img = normalize_maldi_img(maldi_img, scale=True)
-    maldi_mask = maldi_img<0.25 #binarized cell area based on local-contrast enhanced z-score
-
-    #spectra_all = np.maximum(spectra_all - 0.2, 0)
-    id_dict = {(y-1-mc, x-1-mr): i for i, (x, y, z_) in enumerate(p.coordinates) if ((x-1-mr)>=0 and (y-1-mc)>=0)}
-    he_img = Image.open(he_path)
-    images = he_img.split()
-
-    #log_message("Starting Part3 ...")
-    #Binarize images and map to shared resolution
-    maldi_img_array = prepare_maldi_img(maldi_img, scale_factor, maldi_threshold, sparsity=sparsity)
-    he_img_bin, buffered_he_shp, target_he_size = prepare_he_img(he_img, buffer=buffer, he_ratio=he_ratio, he_threshold=he_threshold)
-    #f_img_bin, target_f_shp, target_f_size = prepare_f_img(f_img, f_ratio=f_ratio, f_threshold=f_threshold)
-
-    #Find common rotation between MALDI and HE
-    he_container, idx, _, max_he_rotation, max_hbuff_x, max_hbuff_y = \
-        optimize_he_rotation_to_maldi(he_img_bin, maldi_img_array, [180, -1.0, -0.5, 0, 0.5, 1.0, 1.5], target_he_size, buffered_he_shp, buffer=buffer) #-0.15, 180 (slide1)
-        #optimize_he_rotation_to_maldi(he_img_bin, maldi_img_array, [0.], target_he_size, buffered_he_shp, buffer=buffer) #-0.15, 180 (slide1)
-        #optimize_he_rotation_to_maldi(he_img_bin, maldi_img_array, [180], target_he_size, buffered_he_shp, buffer=buffer) #-0.15, 180 (slide1)
-        
-
-    #Map original images to shared resolution and rotation
-    he_img_resize = he_img.resize(target_he_size, resample=Image.Resampling.NEAREST)
-    he_img_container = put_img_in_container(he_img_resize, (*buffered_he_shp, 3), max_hbuff_x, -max_hbuff_x, 
-        max_hbuff_y, -max_hbuff_y, max_he_rotation, dtype=np.uint8)
-
-    mzs = ["%.1f"%peak for peak in  peaks[-5:]]
-
-    if extra_img_path: 
-        segment_img = Image.open(extra_img_path)
-        segment_img = segment_img.resize(target_he_size, resample=Image.Resampling.NEAREST)
-        cell_id_container = put_img_in_container(segment_img, buffered_he_shp, max_hbuff_x, -max_hbuff_x, 
-            max_hbuff_y, -max_hbuff_y, max_he_rotation, dtype=np.int32)
-    else:
-        cell_id_container = np.zeros((he_img_container.shape[0], he_img_container.shape[1]), dtype=np.int32)
-  
-
-
-
-    ### Create AnnData Object
-
-    spectra_shp = spectra_all.shape
-    adata = ad.AnnData(spectra_all.reshape(-1, spectra_all.shape[-1]), dtype=np.float32)
-    adata.var_names = np.array(["%.1f"%p for p in peaks])
-    adata.obs_names = np.array(list(map(str, range(spectra_shp[0]*spectra_shp[1]))))
-
-
-    # Extract original coordinates from ImzML
-    coords = np.array(p.coordinates)[:, :2]  # (x, y)
-    coords = coords - 1  # convert from 1-based to 0-based indexing
-
-    # Convert to integer indices
-    x_coords, y_coords = coords[:, 0].astype(int), coords[:, 1].astype(int)
-
-    # Reshape spectra_all to match how adata rows were created
-    h, w, _ = spectra_all.shape
-
-    # Build coordinate grids corresponding to flattened order (y-major)
-    yy, xx = np.mgrid[mc:h+mc, mr:w+mr]
-    yy = yy.flatten()
-    xx = xx.flatten()
-
-    # Add them as columns to adata.obs
-    adata.obs["x"] = xx
-    adata.obs["y"] = yy
-
-    # Also store as spatial coordinates for plotting
-    adata.obsm["spatial"] = np.vstack([xx, yy]).T
+    # Native MALDI grid coords (unscaled, for analysis)
+    yy, xx = np.mgrid[crop_r: maldi_h + crop_r, crop_c: maldi_w + crop_c]
+    adata.obs["x"]   = xx.flatten()
+    adata.obs["y"]   = yy.flatten()
     adata.obs["MPI"] = np.ravel(adata.X.sum(axis=1))
 
+    # obsm["spatial"] in upscaled H&E canvas coordinates
+    # This is the coordinate system napari reads for spot placement
+    adata.obsm["spatial"] = np.column_stack([he_c, he_r])
+    adata.obs["he_x"]     = he_c
+    adata.obs["he_y"]     = he_r
 
-    cluster_img = generate_MPI_img(spectra_shp, adata)
-    cluster_img0 = np.asarray(Image.fromarray(cluster_img).resize((cluster_img.shape[1]*scale_factor, cluster_img.shape[0]*scale_factor), resample=Image.Resampling.NEAREST))
-    container = np.zeros((cell_id_container.shape[0], cell_id_container.shape[1]), dtype=np.int32)
-    container[idx[0]:(idx[0]+cluster_img0.shape[0]), idx[1]:(idx[1]+cluster_img0.shape[1])] = cluster_img0
+    # uns["spatial"] — same structure as Add_Pseudo_Image so napari knows
+    # the correct spot size without needing a separate Add_Pseudo_Image call.
+    # spot_diameter_fullres = us means each spot fills its full pixel footprint.
+    adata.uns["spatial"] = {
+        library_id: {
+            "images": {"hires": he_up},
+            "use_quality": "hires",
+            "scalefactors": {
+                f"tissue_hires_scalef": 1.0,
+                "spot_diameter_fullres": float(us),
+            },
+        }
+    }
 
-    cell_id = adata.obs.index.to_numpy().astype(np.int32)
-    cell_map = np.zeros((maldi_img.shape[0], maldi_img.shape[1]), dtype=np.int32)
-    for k in cell_id:
-        cell_idx = np.unravel_index(k, (maldi_img.shape[0], maldi_img.shape[1]))
-        cell_map[cell_idx[0], cell_idx[1]] = k
-    he_segment = np.asarray(Image.fromarray(cell_map).resize((scale_factor*cell_map.shape[1],scale_factor*cell_map.shape[0]), resample=Image.Resampling.NEAREST))
-    cell_id_container[idx[0]:(idx[0]+he_segment.shape[0]), idx[1]:(idx[1]+he_segment.shape[1])] = he_segment
+    pixel_idx = np.arange(maldi_h * maldi_w).astype(str)
 
+    # --- Shapes: squares sized to exactly one MALDI pixel in upscaled space ---
+    # With upscaling, each MALDI pixel now spans us × us canvas pixels.
+    # A box of half-width us/2 tiles perfectly without gaps.
+    half = us / 2.0
+    geoms = [
+        box(float(c) - half, float(r) - half,
+            float(c) + half, float(r) + half)
+        for r, c in zip(he_r, he_c)
+    ]
+    gdf    = gpd.GeoDataFrame({"cell_id": pixel_idx}, geometry=geoms)
+    shapes = ShapesModel.parse(gdf, transformations={"global": Identity()})
 
-    ### Generate SpatialData Object
+    # --- Points (centroids in upscaled space) ---
+    pts_df    = pd.DataFrame({"x": he_c, "y": he_r, "cell_id": pixel_idx})
+    centroids = PointsModel.parse(pts_df)
 
-    # Find indices where values are non-zero
-    y, x = np.nonzero(cell_id_container)
-
-    # Build DataFrame
-    df = pd.DataFrame({
-        "x": x,
-        "y": y,
-        "value": cell_id_container[y, x]
-    })
-
-    # df: x, y, value  (value == adata.obs.index)
-    df_points = df.rename(columns={"value": "cell_id"})
-    df_points["cell_id"] = df_points["cell_id"].astype(str)
-
-    valid_cell_ids = df_points["cell_id"].unique()
-
-    # Filter adata to only these cells
-    adata = adata[valid_cell_ids, :].copy()
-    adata.obs.index = adata.obs.index.astype(str)
-
-    pixel_boxes = (
-        df_points
-        .groupby("cell_id")
-        .agg(
-            x_min=("x", "min"),
-            x_max=("x", "max"),
-            y_min=("y", "min"),
-            y_max=("y", "max"),
-        )
-        .reset_index()
-    )
-
-    pixel_boxes["x_centroid"] = (pixel_boxes["x_min"] + pixel_boxes["x_max"]) / 2
-    pixel_boxes["y_centroid"] = (pixel_boxes["y_min"] + pixel_boxes["y_max"]) / 2
-
-    centroids = PointsModel.parse(
-        pixel_boxes[["x_centroid", "y_centroid", "cell_id"]]
-            .rename(columns={"x_centroid": "x", "y_centroid": "y"}),
-    )
-
-    pixel_boxes["geometry"] = pixel_boxes.apply(
-        lambda r: box(
-            r.x_min,
-            r.y_min,
-            r.x_max + 1,  # +1 to make inclusive
-            r.y_max + 1,
-        ),
-        axis=1,
-    )
-
-
-    adata.obs["adata_idx"] = adata.obs.index
-    adata_df = adata.obs
-    adata_df.index = adata_df.index.astype(str)
-
-    pixel_boxes["MPI"] = pixel_boxes["cell_id"].map(adata_df["MPI"])
-    pixel_boxes["adata_idx"] = pixel_boxes["cell_id"].map(adata_df["adata_idx"])
-
-
-    pixel_boxes = (
-        pixel_boxes
-        .set_index("adata_idx")
-        .loc[adata.obs.index]
-    )
-
-    # pixel_boxes already has: cell_id, geometry (shapely)
-    gdf = gpd.GeoDataFrame(pixel_boxes[["cell_id","MPI", "geometry"]], geometry="geometry")
-
-
-    shapes = ShapesModel.parse(
-        gdf,
-        transformations={"global": Identity()},
-    )
-
-
-    image_cyx = np.transpose(he_img_container, (2, 0, 1))
+    # --- H&E image (upscaled) ---
+    image_cyx = np.transpose(he_up, (2, 0, 1))
     img_model = Image2DModel.parse(
-        image_cyx,
-        dims=("c", "y", "x"),
+        image_cyx, dims=("c", "y", "x"),
         transformations={"global": Identity()},
-    )   
+    )
 
+    # --- Assemble ---
     sdata = SpatialData(
-    images={"he_image": img_model},
-    points={"centroids": centroids},
-    shapes={"pixels": shapes},
+        images={"he_image": img_model},
+        points={"centroids": centroids},
+        shapes={"pixels": shapes},
     )
 
     adata.obs["instance_id"] = sdata["pixels"].index
-    adata.obs["region"] = "pixels"
-    adata.obs["region"].astype("category")
+    adata.obs["region"]      = "pixels"
+    adata.obs["region"]      = adata.obs["region"].astype("category")
 
-    table = TableModel.parse(adata, region="pixels", region_key="region", instance_key="instance_id")
+    table = TableModel.parse(
+        adata, region="pixels",
+        region_key="region", instance_key="instance_id",
+    )
     sdata["maldi_adata"] = table
+    return sdata
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def load_and_align(
+    imzml_path: str,
+    he_path: str,
+    peaks_path: Optional[str] = None,
+    maldi_pixel_um: Optional[float] = None,
+    he_pixel_um: Optional[float] = None,
+    spectra_chunk_size: int = 10,
+    coarse_rotation_step: int = 15,
+    fine_rotation_range: float = 5.0,
+    fine_rotation_step: float = 1.0,
+    buffer_px: int = 150,
+    img_upscaling: int = 10,
+) -> SpatialData:
+    """
+    Load a MALDI imzML dataset and an H&E image, auto-register them,
+    and return a merged SpatialData object.
+
+    The output H&E image is the FULL rotated slide (no cropping), so the
+    MALDI data is visible in the context of the complete tissue section.
+
+    Registration uses normalised grayscale cross-correlation (no binary
+    thresholds) with a two-pass rotation search (coarse 0–360°, then fine).
+
+    Parameters
+    ----------
+    imzml_path : str
+        Path to the .imzML file.
+    he_path : str
+        Path to the H&E image.  SVS/NDPI require openslide:
+            conda install -c conda-forge openslide openslide-python
+    peaks_path : str or None
+        Path to peaks CSV.  Uses bundled PEAKS.csv when None.
+    maldi_pixel_um : float or None, default None
+        Native MALDI pixel size in µm.  When None (default), this is
+        auto-read from the imzML scan settings metadata (IMS:1000046).
+        Only set manually if auto-detection gives a wrong value.
+        Common values: 10, 20, 50, 100 µm.
+    he_pixel_um : float or None
+        Native H&E pixel size in µm.  Auto-read from metadata when None.
+    spectra_chunk_size : int, default 10
+        Ion images loaded in parallel at once.  Reduce if memory is tight.
+    coarse_rotation_step : int, default 15
+        Degrees between candidates in the 0–360° coarse sweep.
+    fine_rotation_range : float, default 5.0
+        ± degrees searched around the best coarse angle.
+    fine_rotation_step : float, default 1.0
+        Degree increment for fine search.
+    buffer_px : int, default 150
+        Extra canvas padding (px at reg resolution) for the rotation search.
+    img_upscaling : int, default 10
+        Each MALDI pixel is upscaled to img_upscaling × img_upscaling canvas
+        pixels in the output.  This matches the Add_Pseudo_Image convention
+        and ensures napari renders spots at a visible size.  The value is
+        stored in adata.uns["spatial"]["scalefactors"]["spot_diameter_fullres"]
+        so napari-spatialdata reads the correct spot size automatically.
+        Reduce to 5 for very large MALDI grids to save memory.
+
+    Returns
+    -------
+    SpatialData with:
+        images['he_image']    — H&E cropped to MALDI region + context
+        shapes['pixels']      — one square per MALDI pixel (in H&E crop coords)
+        points['centroids']   — centroid of each MALDI pixel
+        tables['maldi_adata'] — AnnData (ion intensities + he_x, he_y coords)
+    """
+
+    # ------------------------------------------------------------------
+    # 0. Peaks
+    # ------------------------------------------------------------------
+    _log("Loading peaks …")
+    peaks = rd_peaks(peaks_path) if peaks_path else rd_peaks_from_package()
+    _log(f"  {len(peaks)} peaks")
+
+    # ------------------------------------------------------------------
+    # 0b. H&E native pixel size — needed for MALDI validation below
+    # ------------------------------------------------------------------
+    if he_pixel_um is None:
+        he_pixel_um = _read_native_mpp(he_path)
+        if he_pixel_um is None:
+            # Try reading from PIL TIFF tags directly
+            try:
+                _img = Image.open(he_path)
+                tag_info = getattr(_img, 'tag_v2', {})
+                xres = tag_info.get(282)
+                unit = tag_info.get(296, 2)
+                if xres is not None:
+                    xres = xres[0] / xres[1] if isinstance(xres, tuple) else float(xres)
+                    he_pixel_um = (10000.0 / xres) if unit == 3 else (25400.0 / xres)
+                    _log(f"  H&E pixel size from TIFF tags: {he_pixel_um:.4f} µm/px")
+                _img.close()
+            except Exception:
+                pass
+        if he_pixel_um is None:
+            he_pixel_um = 0.2527
+            _log(f"  WARNING: H&E pixel size unknown — assuming {he_pixel_um} µm/px. "
+                 f"Pass he_pixel_um= to override.")
+        else:
+            _log(f"  H&E native pixel size: {he_pixel_um:.4f} µm/px")
+
+    # H&E physical dimensions in µm (used for MALDI validation below)
+    try:
+        _he_probe = Image.open(he_path)
+        _he_native_w, _he_native_h = _he_probe.size
+        _he_probe.close()
+    except Exception:
+        _he_native_w, _he_native_h = 10000, 10000   # safe fallback
+    he_phys_w_um = _he_native_w * he_pixel_um
+    he_phys_h_um = _he_native_h * he_pixel_um
+
+    # ------------------------------------------------------------------
+    # 0c. MALDI pixel size — auto-read from imzML, then validate
+    # ------------------------------------------------------------------
+    if maldi_pixel_um is None:
+        detected = _read_maldi_pixel_size(imzml_path)
+        if detected is not None:
+            _log(f"  MALDI pixel size from imzML metadata: {detected} µm/px")
+            # Sanity check: at this pixel size, MALDI must be smaller than H&E
+            # and the H&E thumbnail must be at least as large as the MALDI array
+            # (required by matchTemplate).
+            # We load a small probe to get MALDI array dimensions.
+            _p_probe = ImzMLParser(imzml_path)
+            _maldi_h = _p_probe.imzmldict.get('max count of pixels y', 1)
+            _maldi_w = _p_probe.imzmldict.get('max count of pixels x', 1)
+            _he_thumb_w = he_phys_w_um / detected
+            _he_thumb_h = he_phys_h_um / detected
+            if _he_thumb_w >= _maldi_w and _he_thumb_h >= _maldi_h:
+                maldi_pixel_um = detected
+                _log(f"  Validated: H&E thumbnail ({_he_thumb_w:.0f}×{_he_thumb_h:.0f} px) "
+                     f">= MALDI ({_maldi_w}×{_maldi_h} px) ✓")
+            else:
+                _log(f"  WARNING: imzML pixel size {detected} µm makes H&E thumbnail "
+                     f"({_he_thumb_w:.0f}×{_he_thumb_h:.0f} px) smaller than MALDI "
+                     f"({_maldi_w}×{_maldi_h} px) — this value is likely wrong.")
+                _log(f"  Trying common MALDI pixel sizes …")
+                for candidate in [10.0, 20.0, 50.0, 100.0, 200.0]:
+                    _cw = he_phys_w_um / candidate
+                    _ch = he_phys_h_um / candidate
+                    if _cw >= _maldi_w * 0.5 and _ch >= _maldi_h * 0.5:
+                        maldi_pixel_um = candidate
+                        _log(f"  Auto-selected maldi_pixel_um={candidate} µm/px "
+                             f"(H&E thumbnail: {_cw:.0f}×{_ch:.0f} px, "
+                             f"MALDI: {_maldi_w}×{_maldi_h} px)")
+                        break
+                if maldi_pixel_um is None:
+                    maldi_pixel_um = 10.0
+                    _log(f"  Falling back to maldi_pixel_um=10.0 µm/px. "
+                         f"Pass maldi_pixel_um= explicitly if wrong.")
+        else:
+            maldi_pixel_um = 10.0
+            _log(f"  Pixel size not found in imzML — defaulting to {maldi_pixel_um} µm/px. "
+                 f"Pass maldi_pixel_um= explicitly if wrong.")
+    else:
+        _log(f"  MALDI pixel size (supplied): {maldi_pixel_um} µm/px")
+
+    _log(f"  Using maldi_pixel_um={maldi_pixel_um} µm/px  |  he_pixel_um={he_pixel_um:.4f} µm/px")
+    _log(f"  MALDI physical size: "
+         f"{he_phys_w_um/1000:.1f}×{he_phys_h_um/1000:.1f} mm (H&E)  |  "
+         f"MALDI grid × {maldi_pixel_um} µm/px")
+
+    # ------------------------------------------------------------------
+    # 2. MALDI crop offsets
+    # ------------------------------------------------------------------
+    _log("Computing MALDI crop offsets …")
+    p         = ImzMLParser(imzml_path)
+    tic_probe = np.nansum(
+        np.stack([getimage(pk, path=imzml_path) for pk in peaks[:5]], axis=-1),
+        axis=-1,
+    )
+    crop_r, crop_c = _crop_offsets(tic_probe)
+    _log(f"  Crop: row={crop_r}, col={crop_c}")
+    del tic_probe
+    gc.collect()
+
+    # ------------------------------------------------------------------
+    # 3. Load spectra in chunks
+    # ------------------------------------------------------------------
+    _log(f"Loading {len(peaks)} ion images (chunk={spectra_chunk_size}) …")
+    spectra_all = _load_spectra(
+        imzml_path, peaks,
+        chunk_size=spectra_chunk_size,
+        crop_r=crop_r, crop_c=crop_c,
+    )
+    _log(f"  spectra_all: {spectra_all.shape}  ({spectra_all.nbytes/1e6:.0f} MB)")
+
+    # ------------------------------------------------------------------
+    # 4. MALDI registration image (normalised grayscale TIC)
+    # ------------------------------------------------------------------
+    _log("Preparing MALDI template …")
+    maldi_tic  = spectra_all.sum(axis=-1).astype(np.float32)
+    maldi_gray = _maldi_to_grayscale(maldi_tic)
+    del maldi_tic
+    gc.collect()
+
+    # ------------------------------------------------------------------
+    # 5. H&E at MALDI native resolution
+    # ------------------------------------------------------------------
+    _log(f"Loading H&E at {maldi_pixel_um} µm/px …")
+    he_img, loaded_mpp = _load_he_at_resolution(he_path, maldi_pixel_um, he_pixel_um)
+    _log(f"  H&E: {he_img.width}×{he_img.height}  ({he_img.width*he_img.height*3/1e6:.0f} MB)")
+
+    # ------------------------------------------------------------------
+    # 6. H&E registration image (normalised inverted grayscale)
+    # ------------------------------------------------------------------
+    _log("Preparing H&E search image …")
+    he_gray = _he_to_grayscale(he_img)
+
+    # ------------------------------------------------------------------
+    # 7. Two-pass rotation + translation search
+    # ------------------------------------------------------------------
+    _log("Running registration …")
+    best_rot, best_idx = _register(
+        he_gray, maldi_gray,
+        coarse_step=coarse_rotation_step,
+        fine_range=fine_rotation_range,
+        fine_step=fine_rotation_step,
+        buffer_px=buffer_px,
+    )
+    del he_gray, maldi_gray
+    gc.collect()
+
+    # ------------------------------------------------------------------
+    # 8. Build full H&E output canvas (rotated, no cropping)
+    # ------------------------------------------------------------------
+    _log("Building H&E output canvas …")
+    he_canvas, _ = _build_full_output(
+        he_img    = he_img,
+        rotation  = best_rot,
+        buffer_px = buffer_px,
+    )
+    del he_img
+    gc.collect()
+
+    # ------------------------------------------------------------------
+    # 9. Assemble SpatialData
+    # ------------------------------------------------------------------
+    _log("Building SpatialData …")
+    sdata = _build_spatialdata(
+        spectra_all            = spectra_all,
+        peaks                  = peaks,
+        maldi_pixel_um         = maldi_pixel_um,
+        he_canvas              = he_canvas,
+        maldi_offset_in_canvas = best_idx,
+        reg_mpp                = loaded_mpp,
+        crop_r                 = crop_r,
+        crop_c                 = crop_c,
+        img_upscaling          = img_upscaling,
+    )
+
+    # Store the registration transform in sdata.uns so that
+    # add_qupath_annotations (and any other function needing to map
+    # H&E-native coordinates into the aligned canvas space) can retrieve
+    # all parameters without needing to re-run registration.
+    sdata["maldi_adata"].uns["he_transform"] = {
+        "rotation_deg":    float(best_rot),
+        "maldi_offset":    [int(best_idx[0]), int(best_idx[1])],
+        "he_pixel_um":     float(he_pixel_um),
+        "maldi_pixel_um":  float(maldi_pixel_um),
+        "reg_mpp":         float(loaded_mpp),
+        "buffer_px":       int(buffer_px),
+        "img_upscaling":   int(img_upscaling),
+        # canvas size (rows, cols) of the UNUPSCALED canvas
+        # = (he_h + buffer_px, he_w + buffer_px) after rotation
+        "canvas_shape":    list(he_canvas.shape[:2]),
+    }
+    _log(f"  Transform stored in sdata.uns['he_transform']")
+
+    _log("Done.")
     return sdata

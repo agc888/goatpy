@@ -42,9 +42,9 @@ def parmap(f, X, nprocs=None):
     )
 
 
-def getimage(peak, path): 
+def getimage(peak, path, tol = 0.1): 
     p =  ImzMLParser(path) #individual file pointers otherwise parsing is corrupted
-    return getionimage(p, peak, tol=0.1, reduce_func=max)
+    return getionimage(p, peak, tol=tol, reduce_func=max)
     
 
 def rd_peaks(fn):
@@ -77,7 +77,7 @@ def rd_peaks_from_package():
     return data
 
 
-def glyco_spatialdata(imzml_path, peaks_path = None, pixel_size = 20):
+def glyco_spatialdata(imzml_path, peaks_path = None, tol = 0.1, pixel_size = 20):
 
     # Load Peaks
     if peaks_path is None:
@@ -86,7 +86,7 @@ def glyco_spatialdata(imzml_path, peaks_path = None, pixel_size = 20):
         peaks = rd_peaks(peaks_path)
 
     # Load ImzML data
-    getimg = partial(getimage, path=imzml_path)
+    getimg = partial(getimage, path=imzml_path, tol = tol)
 
     spectra_all = np.stack(
         parmap(getimg, peaks, 10),
