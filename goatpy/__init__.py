@@ -9,6 +9,7 @@ from .graphpca_mod import graphpca_spatialdata, kneighbors_graph_spatial, get_km
 from .auto_align import load_and_align
 from .preprocessing import normalize_spatialdata
 from .he_image import he_spatialdata, add_qupath_annotations
+from .annotation import add_annotations
 
 
 __all__ = [
@@ -22,7 +23,8 @@ __all__ = [
     "launch_landmark_gui",
     "load_and_align",
     "normalize_spatialdata",
-    "add_qupath_annotations"
+    "add_qupath_annotations",
+    "add_annotations"
 ]
 
 __version__ = "0.1.0"
