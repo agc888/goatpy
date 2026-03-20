@@ -8,8 +8,8 @@ from .landmark_alignment import align_image_using_landmarks, launch_landmark_gui
 from .graphpca_mod import graphpca_spatialdata, kneighbors_graph_spatial, get_kmean_clusters
 from .auto_align import load_and_align
 from .preprocessing import normalize_spatialdata
-from .he_image import he_spatialdata, add_qupath_annotations
-from .annotation import add_annotations
+from .he_image import he_spatialdata, add_annotations
+from .annotation import add_qupath_annotations
 
 
 __all__ = [

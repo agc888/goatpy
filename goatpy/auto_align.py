@@ -5,35 +5,28 @@ Auto-registration of a MALDI imzML dataset against a whole-slide H&E image.
 
 Key design decisions
 --------------------
-1.  Registration is performed at MALDI native pixel size (default 10 µm/px)
-    so the H&E thumbnail is tiny (~16 MB) and peak RAM stays under 300 MB.
+1.  Registration is performed at MALDI native pixel size (default 10 um/px)
+    so the H&E thumbnail is tiny and peak RAM stays manageable.
 
-2.  Matching uses raw normalised grayscale cross-correlation (TM_CCOEFF_NORMED)
-    on the TIC image vs inverted H&E intensity.  No binary thresholding is
-    needed — NCC handles intensity scale differences automatically and is more
-    discriminative than binary template matching.
+2.  Matching uses normalised grayscale cross-correlation (TM_CCOEFF_NORMED)
+    on the TIC image vs inverted H&E intensity.
 
-3.  The output SpatialData is CROPPED to the MALDI region (plus padding).
-    Storing the entire whole-slide H&E is unnecessary and makes visualisation
-    confusing.  The returned H&E image shows only the tissue area covered by
-    the MALDI scan, at the registration resolution.
-
-4.  A two-pass rotation search (coarse 0–360°, then fine) finds the correct
+3.  A two-pass rotation search (coarse 0-360, then fine) finds the correct
     slide orientation without assuming any starting angle.
 
-5.  he_transform stores he_reg_size (H&E size at reg_mpp BEFORE rotation) and
-    canvas_placement (exact pr, pc offsets where the rotated H&E was placed in
-    the canvas).  These are used by add_qupath_annotations to transform QuPath
-    GeoJSON annotations into the aligned coordinate system without any
-    reconstruction ambiguity.
+4.  Optional QuPath GeoJSON annotations can be passed via geojson_path.
+    They are transformed at the exact moment the H&E canvas is built,
+    using the live PIL rotation values so no reconstruction is needed.
 """
 
 from __future__ import annotations
 
 import os
 import gc
+import json
 from functools import partial
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -41,8 +34,10 @@ import anndata as ad
 import geopandas as gpd
 import cv2 as cv
 from PIL import Image
-from scipy.ndimage import uniform_filter
-from shapely.geometry import box
+from shapely.geometry import box, shape
+from shapely.affinity import rotate as shapely_rotate
+from shapely.affinity import scale as shapely_scale
+from shapely.affinity import translate
 
 from spatialdata import SpatialData
 from spatialdata.models import Image2DModel, PointsModel, ShapesModel, TableModel
@@ -110,8 +105,8 @@ def _load_he_at_resolution(he_path: str,
         region = slide.read_region((0, 0), best_level, dims)
         img    = region.convert('RGB')
         slide.close()
-        _log(f"  openslide level {best_level}: {dims[0]}×{dims[1]}  "
-             f"{best_mpp:.3f} µm/px  ({img.width*img.height*3/1e6:.0f} MB)")
+        _log(f"  openslide level {best_level}: {dims[0]}x{dims[1]}  "
+             f"{best_mpp:.3f} um/px  ({img.width*img.height*3/1e6:.0f} MB)")
 
         if abs(best_mpp - target_mpp) / target_mpp > 0.02:
             scale = best_mpp / target_mpp
@@ -119,7 +114,7 @@ def _load_he_at_resolution(he_path: str,
             nh    = max(1, round(img.height * scale))
             img   = img.resize((nw, nh), Image.Resampling.LANCZOS)
             best_mpp = target_mpp
-            _log(f"  Resized to {nw}×{nh}  {target_mpp:.3f} µm/px")
+            _log(f"  Resized to {nw}x{nh}  {target_mpp:.3f} um/px")
 
         return img, best_mpp
 
@@ -129,16 +124,15 @@ def _load_he_at_resolution(he_path: str,
                 f"\nFailed to open '{he_path}' with openslide: {e}\n\n"
                 "SVS/NDPI files require openslide:\n"
                 "  conda install -c conda-forge openslide openslide-python\n"
-                "  brew install openslide  (macOS)\n"
             ) from e
 
     img = Image.open(he_path).convert('RGB')
-    _log(f"  PIL: {img.width}×{img.height}")
+    _log(f"  PIL: {img.width}x{img.height}")
     scale = native_mpp / target_mpp
     nw    = max(1, round(img.width  * scale))
     nh    = max(1, round(img.height * scale))
     img   = img.resize((nw, nh), Image.Resampling.LANCZOS)
-    _log(f"  Resized to {nw}×{nh}  {target_mpp:.3f} µm/px  ({nw*nh*3/1e6:.0f} MB)")
+    _log(f"  Resized to {nw}x{nh}  {target_mpp:.3f} um/px  ({nw*nh*3/1e6:.0f} MB)")
     return img, target_mpp
 
 
@@ -166,15 +160,11 @@ def _load_spectra(imzml_path: str,
         for j, img in enumerate(imgs):
             out[:, :, start + j] = img[crop_r:, crop_c:]
         del imgs
-        _log(f"  Peaks {start+1}–{min(start+len(batch), len(peaks))} / {len(peaks)}")
+        _log(f"  Peaks {start+1}-{min(start+len(batch), len(peaks))} / {len(peaks)}")
     return out
 
 
 def _read_maldi_pixel_size(imzml_path: str) -> Optional[float]:
-    """
-    Read the pixel size in µm from imzML scan settings metadata.
-    Returns None if not found.
-    """
     try:
         p = ImzMLParser(imzml_path)
         for key in ['pixel size (x)', 'pixel size x', 'pixel size']:
@@ -196,56 +186,34 @@ def _crop_offsets(spectra_sum: np.ndarray, cutoff: float = 0.5) -> tuple[int, in
 
 
 # ---------------------------------------------------------------------------
-# Image preparation — grayscale normalised for NCC
+# Image preparation
 # ---------------------------------------------------------------------------
 
 def _maldi_to_grayscale(tic: np.ndarray) -> np.ndarray:
-    """
-    Convert MALDI TIC to a float32 grayscale image normalised to [0, 1].
-    """
     blurred = cv.GaussianBlur(tic, (3, 3), 0)
     mn, mx  = blurred.min(), blurred.max()
-    if mx > mn:
-        norm = (blurred - mn) / (mx - mn)
-    else:
-        norm = blurred * 0.0
-    _log(f"  MALDI grayscale: {norm.shape}  "
-         f"mean={norm.mean():.3f}  nonzero={np.count_nonzero(norm)/norm.size:.1%}")
+    norm    = (blurred - mn) / (mx - mn) if mx > mn else blurred * 0.0
+    _log(f"  MALDI grayscale: {norm.shape}  mean={norm.mean():.3f}")
     return norm.astype(np.float32)
 
 
 def _he_to_grayscale(he_img: Image.Image) -> np.ndarray:
-    """
-    Convert H&E to a float32 grayscale image normalised to [0, 1].
-
-    H&E tissue stains dark (low pixel values) while glass background is
-    bright.  Inverting means tissue → high values, matching MALDI convention.
-    """
     gray = np.array(he_img.convert('L'), dtype=np.float32)
     inv  = 255.0 - gray
     mn, mx = inv.min(), inv.max()
-    if mx > mn:
-        norm = (inv - mn) / (mx - mn)
-    else:
-        norm = inv * 0.0
-    _log(f"  H&E grayscale: {norm.shape}  "
-         f"mean={norm.mean():.3f}  nonzero={np.count_nonzero(norm)/norm.size:.1%}")
+    norm   = (inv - mn) / (mx - mn) if mx > mn else inv * 0.0
+    _log(f"  H&E grayscale: {norm.shape}  mean={norm.mean():.3f}")
     return norm.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# Registration — two-pass rotation + translation
+# Registration
 # ---------------------------------------------------------------------------
 
 def _match_at_rotation(he_gray: np.ndarray,
                         maldi_gray: np.ndarray,
                         rotation: float,
                         canvas_shape: tuple[int, int]) -> tuple[float, tuple[int, int]]:
-    """
-    Rotate H&E, place centred in canvas, run NCC template match.
-    Returns (score, (row, col)) where (row, col) is the top-left of the
-    MALDI template in the canvas coordinate system.
-    """
     he_pil  = Image.fromarray((he_gray * 255).astype(np.uint8))
     rot_pil = he_pil.rotate(rotation, expand=True, resample=Image.Resampling.BILINEAR)
     rot_arr = np.array(rot_pil, dtype=np.float32) / 255.0
@@ -260,16 +228,14 @@ def _match_at_rotation(he_gray: np.ndarray,
 
     if canvas.shape[0] < maldi_gray.shape[0] or canvas.shape[1] < maldi_gray.shape[1]:
         raise ValueError(
-            f"H&E canvas ({canvas.shape[1]}×{canvas.shape[0]} px) is smaller than "
-            f"MALDI template ({maldi_gray.shape[1]}×{maldi_gray.shape[0]} px) at "
-            f"the current registration resolution.\n"
-            f"This usually means maldi_pixel_um is too large.\n"
+            f"H&E canvas ({canvas.shape[1]}x{canvas.shape[0]} px) is smaller than "
+            f"MALDI template ({maldi_gray.shape[1]}x{maldi_gray.shape[0]} px).\n"
             f"Try passing maldi_pixel_um=10 or maldi_pixel_um=20 explicitly."
         )
+
     result           = cv.matchTemplate(canvas, maldi_gray, cv.TM_CCOEFF_NORMED)
     _, score, _, loc = cv.minMaxLoc(result)
-
-    return float(score), (int(loc[1]), int(loc[0]))   # (row, col)
+    return float(score), (int(loc[1]), int(loc[0]))
 
 
 def _register(he_gray: np.ndarray,
@@ -278,20 +244,12 @@ def _register(he_gray: np.ndarray,
               fine_range: float = 5.0,
               fine_step: float = 1.0,
               buffer_px: int = 150) -> tuple[float, tuple[int, int]]:
-    """
-    Two-pass rotation + translation search using normalised cross-correlation.
-
-    Returns
-    -------
-    rotation : float — degrees to rotate H&E (PIL CCW convention)
-    offset   : (row, col) — top-left of MALDI in the rotated+centred canvas
-    """
     canvas_h     = he_gray.shape[0] + buffer_px
     canvas_w     = he_gray.shape[1] + buffer_px
     canvas_shape = (canvas_h, canvas_w)
 
     coarse_rots = list(range(0, 360, coarse_step))
-    _log(f"  Coarse: {len(coarse_rots)} rotations (0–360° step {coarse_step}°) …")
+    _log(f"  Coarse: {len(coarse_rots)} rotations (0-360 step {coarse_step}) ...")
 
     best_score = -np.inf
     best_rot   = 0.0
@@ -299,27 +257,122 @@ def _register(he_gray: np.ndarray,
 
     for rot in coarse_rots:
         score, idx = _match_at_rotation(he_gray, maldi_gray, rot, canvas_shape)
-        _log(f"    {rot:5.1f}°  score={score:.4f}")
+        _log(f"    {rot:5.1f}  score={score:.4f}")
         if score > best_score:
             best_score, best_rot, best_idx = score, float(rot), idx
 
-    _log(f"  Best coarse: {best_rot}°  score={best_score:.4f}")
+    _log(f"  Best coarse: {best_rot}  score={best_score:.4f}")
 
     fine_rots = sorted({
         round(best_rot + d, 1)
         for d in np.arange(-fine_range, fine_range + fine_step, fine_step)
         if abs(d) > 1e-6
     })
-    _log(f"  Fine: {len(fine_rots)} rotations (±{fine_range}° step {fine_step}°) …")
+    _log(f"  Fine: {len(fine_rots)} rotations (+-{fine_range} step {fine_step}) ...")
 
     for rot in fine_rots:
         score, idx = _match_at_rotation(he_gray, maldi_gray, rot, canvas_shape)
-        _log(f"    {rot:5.1f}°  score={score:.4f}")
+        _log(f"    {rot:5.1f}  score={score:.4f}")
         if score > best_score:
             best_score, best_rot, best_idx = score, rot, idx
 
-    _log(f"  Final: {best_rot}°  score={best_score:.4f}  offset={best_idx}")
+    _log(f"  Final: {best_rot}  score={best_score:.4f}  offset={best_idx}")
     return best_rot, best_idx
+
+
+# ---------------------------------------------------------------------------
+# Annotation transform
+# ---------------------------------------------------------------------------
+
+def _transform_geojson(
+    geojson_path: Union[str, Path],
+    he_pixel_um: float,
+    reg_mpp: float,
+    he_reg_w: int,
+    he_reg_h: int,
+    rotation_deg: float,
+    canvas_pr: int,
+    canvas_pc: int,
+    img_upscaling: int,
+    classification_key: str = "classification",
+) -> gpd.GeoDataFrame:
+    """
+    Transform QuPath GeoJSON annotations into the aligned canvas coordinate
+    system using values captured directly from the PIL rotation step.
+
+    Parameters
+    ----------
+    geojson_path   : path to QuPath GeoJSON (native H&E pixel coords)
+    he_pixel_um    : native H&E pixel size (um/px)
+    reg_mpp        : registration resolution (um/px)
+    he_reg_w       : H&E width  at reg_mpp BEFORE rotation
+    he_reg_h       : H&E height at reg_mpp BEFORE rotation
+    rotation_deg   : CCW rotation applied by PIL
+    canvas_pr      : row offset of rotated H&E top-left in canvas (from PIL directly)
+    canvas_pc      : col offset of rotated H&E top-left in canvas (from PIL directly)
+    img_upscaling  : upscaling factor matching the stored H&E image
+
+    Pipeline per geometry
+    ---------------------
+    1. Scale     : native H&E px -> reg_mpp  (factor = he_pixel_um / reg_mpp)
+    2. Rotate    : CCW around centre of pre-rotation H&E (he_reg_w/2, he_reg_h/2)
+    3. Translate : shift by (canvas_pc, canvas_pr) -- exact integers from PIL
+    4. Upscale   : multiply by img_upscaling
+    """
+    with open(geojson_path, "r") as f:
+        geojson = json.load(f)
+
+    features = geojson if isinstance(geojson, list) else geojson.get("features", [])
+    if not features:
+        raise ValueError(f"No features found in {geojson_path}")
+
+    scale_factor = he_pixel_um / reg_mpp
+    cx = he_reg_w / 2.0
+    cy = he_reg_h / 2.0
+
+    geoms  = []
+    labels = []
+    names  = []
+
+    for feat in features:
+        geom_raw = feat.get("geometry")
+        if geom_raw is None:
+            continue
+
+        geom = shape(geom_raw)
+
+        # 1. Scale to registration resolution
+        geom = shapely_scale(geom, xfact=scale_factor, yfact=scale_factor,
+                             origin=(0, 0))
+
+        # 2. Rotate CCW around the centre of the pre-rotation H&E image.
+        #    PIL rotates around (width/2, height/2) before expand=True enlarges
+        #    the canvas -- shapely uses (x=col, y=row) so origin=(cx, cy).
+        geom = shapely_rotate(geom, angle=rotation_deg, origin=(cx, cy),
+                              use_radians=False)
+
+        # 3. Translate by the canvas placement offsets captured directly from
+        #    PIL's integer // 2 arithmetic in _build_full_output.
+        #    No formula reconstruction -- these are the exact same integers.
+        geom = translate(geom, xoff=canvas_pc, yoff=canvas_pr)
+
+        # 4. Upscale to match the stored H&E image
+        geom = shapely_scale(geom, xfact=img_upscaling, yfact=img_upscaling,
+                             origin=(0, 0))
+
+        geoms.append(geom)
+
+        props = feat.get("properties") or {}
+        clf   = props.get("classification") or {}
+        label = clf.get("name", "unknown") if isinstance(clf, dict) else str(clf)
+        name  = props.get("name", "")
+        labels.append(label)
+        names.append(name)
+
+    return gpd.GeoDataFrame(
+        {classification_key: labels, "name": names},
+        geometry=geoms,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -328,20 +381,15 @@ def _register(he_gray: np.ndarray,
 
 def _build_full_output(he_img: Image.Image,
                         rotation: float,
-                        buffer_px: int,
-                        ) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
+                        buffer_px: int) -> tuple[np.ndarray, int, int]:
     """
-    Rotate the H&E thumbnail and place it in a canvas (no cropping).
+    Rotate the H&E thumbnail and place it centred in a zero-padded canvas.
 
     Returns
     -------
-    canvas_rgb    : np.ndarray (H, W, 3) uint8  — full rotated H&E
-    canvas_origin : (0, 0)  — no crop applied
-    he_placement  : (pr, pc)  — exact row/col offset where the top-left of the
-                    rotated H&E image was placed inside the canvas.
-                    Stored in he_transform["canvas_placement"] so that
-                    add_qupath_annotations can reconstruct the transform
-                    without any floating-point approximation.
+    canvas : np.ndarray (H, W, 3) uint8
+    pr     : int  -- row offset where rotated H&E top-left was placed
+    pc     : int  -- col offset where rotated H&E top-left was placed
     """
     canvas_h = he_img.height + buffer_px
     canvas_w = he_img.width  + buffer_px
@@ -358,9 +406,9 @@ def _build_full_output(he_img: Image.Image,
     canvas[pr: pr + use_h, pc: pc + use_w] = rot_arr[:use_h, :use_w]
     del he_rot, rot_arr
 
-    _log(f"  H&E canvas (full): {canvas_w}×{canvas_h}  ({canvas.nbytes/1e6:.0f} MB)")
-    _log(f"  Rotated H&E placed at pr={pr}, pc={pc}  (rotated size: {rw}×{rh})")
-    return canvas, (0, 0), (pr, pc)
+    _log(f"  H&E canvas: {canvas_w}x{canvas_h}  ({canvas.nbytes/1e6:.0f} MB)")
+    _log(f"  Rotated H&E placed at pr={pr}, pc={pc}  (rotated size: {rw}x{rh})")
+    return canvas, pr, pc
 
 
 # ---------------------------------------------------------------------------
@@ -377,37 +425,27 @@ def _build_spatialdata(spectra_all: np.ndarray,
                        crop_c: int,
                        img_upscaling: int = 10,
                        library_id: str = "spatial") -> SpatialData:
-    """
-    Assemble SpatialData.
 
-    The H&E image and all coordinates are upscaled by `img_upscaling` so
-    that each MALDI pixel covers img_upscaling × img_upscaling canvas pixels.
-    """
     maldi_h, maldi_w, n_peaks = spectra_all.shape
-
-    scale = maldi_pixel_um / reg_mpp
-
+    scale         = maldi_pixel_um / reg_mpp
     local_off_r, local_off_c = maldi_offset_in_canvas
 
-    us = img_upscaling
+    us      = img_upscaling
     he_up_h = he_canvas.shape[0] * us
     he_up_w = he_canvas.shape[1] * us
-    he_up = np.array(
+    he_up   = np.array(
         Image.fromarray(he_canvas).resize(
             (he_up_w, he_up_h), Image.Resampling.NEAREST
         ),
         dtype=np.uint8,
     )
-    _log(f"  H&E upscaled {us}×: {he_up_w}×{he_up_h}  ({he_up.nbytes/1e6:.0f} MB)")
+    _log(f"  H&E upscaled {us}x: {he_up_w}x{he_up_h}  ({he_up.nbytes/1e6:.0f} MB)")
 
     grid_r, grid_c = np.mgrid[0: maldi_h, 0: maldi_w]
     he_r = ((local_off_r + (grid_r.flatten() + 0.5) * scale) * us)
     he_c = ((local_off_c + (grid_c.flatten() + 0.5) * scale) * us)
 
-    adata = ad.AnnData(
-        spectra_all.reshape(-1, n_peaks).copy(),
-        dtype=np.float32,
-    )
+    adata = ad.AnnData(spectra_all.reshape(-1, n_peaks).copy(), dtype=np.float32)
     adata.var_names = np.array(["%.1f" % pk for pk in peaks])
     adata.obs_names = np.array([str(i) for i in range(maldi_h * maldi_w)])
 
@@ -425,16 +463,15 @@ def _build_spatialdata(spectra_all: np.ndarray,
             "images": {"hires": he_up},
             "use_quality": "hires",
             "scalefactors": {
-                f"tissue_hires_scalef": 1.0,
+                "tissue_hires_scalef": 1.0,
                 "spot_diameter_fullres": float(us),
             },
         }
     }
 
     pixel_idx = np.arange(maldi_h * maldi_w).astype(str)
-
-    half = us / 2.0
-    geoms = [
+    half      = us / 2.0
+    geoms     = [
         box(float(c) - half, float(r) - half,
             float(c) + half, float(r) + half)
         for r, c in zip(he_r, he_c)
@@ -477,6 +514,9 @@ def load_and_align(
     imzml_path: str,
     he_path: str,
     peaks_path: Optional[str] = None,
+    geojson_path: Optional[Union[str, Path]] = None,
+    geojson_shapes_key: str = "annotations",
+    geojson_classification_key: str = "classification",
     maldi_pixel_um: Optional[float] = None,
     he_pixel_um: Optional[float] = None,
     spectra_chunk_size: int = 10,
@@ -490,12 +530,6 @@ def load_and_align(
     Load a MALDI imzML dataset and an H&E image, auto-register them,
     and return a merged SpatialData object.
 
-    The output H&E image is the FULL rotated slide (no cropping), so the
-    MALDI data is visible in the context of the complete tissue section.
-
-    Registration uses normalised grayscale cross-correlation (no binary
-    thresholds) with a two-pass rotation search (coarse 0–360°, then fine).
-
     Parameters
     ----------
     imzml_path : str
@@ -504,52 +538,48 @@ def load_and_align(
         Path to the H&E image.  SVS/NDPI require openslide.
     peaks_path : str or None
         Path to peaks CSV.  Uses bundled PEAKS.csv when None.
+    geojson_path : str, Path, or None
+        Optional path to a QuPath GeoJSON annotation export.  Coordinates
+        must be in native H&E pixel space (QuPath default).
+        Annotations are transformed at registration time using the live PIL
+        values so no reconstruction of the coordinate transform is needed.
+        Result is stored in sdata.shapes[geojson_shapes_key].
+    geojson_shapes_key : str, default "annotations"
+        Key under which annotations are stored in sdata.shapes.
+    geojson_classification_key : str, default "classification"
+        Column name for the QuPath class label in the resulting GeoDataFrame.
     maldi_pixel_um : float or None
-        Native MALDI pixel size in µm.  Auto-read from imzML when None.
+        Native MALDI pixel size in um.  Auto-read from imzML when None.
     he_pixel_um : float or None
-        Native H&E pixel size in µm.  Auto-read from metadata when None.
+        Native H&E pixel size in um.  Auto-read from metadata when None.
     spectra_chunk_size : int
         Ion images loaded in parallel at once.
     coarse_rotation_step : int
-        Degrees between candidates in the 0–360° coarse sweep.
+        Degrees between candidates in the 0-360 coarse sweep.
     fine_rotation_range : float
-        ± degrees searched around the best coarse angle.
+        +/- degrees searched around the best coarse angle.
     fine_rotation_step : float
         Degree increment for fine search.
     buffer_px : int
         Extra canvas padding (px at reg resolution) for the rotation search.
     img_upscaling : int
-        Each MALDI pixel is upscaled to img_upscaling × img_upscaling canvas
+        Each MALDI pixel is upscaled to img_upscaling x img_upscaling canvas
         pixels in the output.
 
     Returns
     -------
     SpatialData with:
-        images['he_image']    — full rotated H&E canvas
-        shapes['pixels']      — one square per MALDI pixel
-        points['centroids']   — centroid of each MALDI pixel
-        tables['maldi_adata'] — AnnData (ion intensities + he_x, he_y coords)
-
-    he_transform keys stored in sdata['maldi_adata'].uns['he_transform']
-    -----------------------------------------------------------------------
-    rotation_deg      : float  — CCW rotation applied to H&E (PIL convention)
-    maldi_offset      : [row, col]  — MALDI top-left in canvas coords
-    he_pixel_um       : float  — native H&E pixel size (µm/px)
-    maldi_pixel_um    : float  — native MALDI pixel size (µm/px)
-    reg_mpp           : float  — resolution used for registration (µm/px)
-    buffer_px         : int    — canvas padding added during registration
-    img_upscaling     : int    — upscaling factor applied to canvas
-    canvas_shape      : [rows, cols]  — canvas size at reg_mpp (unupscaled)
-    he_reg_size       : [rows, cols]  — H&E image size at reg_mpp BEFORE rotation
-    canvas_placement  : [pr, pc]  — exact pixel offset where the rotated H&E
-                        top-left was placed in the canvas (integer, from
-                        _build_full_output).  Used by add_qupath_annotations.
+        images['he_image']             -- full rotated H&E canvas
+        shapes['pixels']               -- one square per MALDI pixel
+        shapes[geojson_shapes_key]     -- annotations (if geojson_path given)
+        points['centroids']            -- centroid of each MALDI pixel
+        tables['maldi_adata']          -- AnnData with ion intensities
     """
 
     # ------------------------------------------------------------------
     # 0. Peaks
     # ------------------------------------------------------------------
-    _log("Loading peaks …")
+    _log("Loading peaks ...")
     peaks = rd_peaks(peaks_path) if peaks_path else rd_peaks_from_package()
     _log(f"  {len(peaks)} peaks")
 
@@ -567,16 +597,15 @@ def load_and_align(
                 if xres is not None:
                     xres = xres[0] / xres[1] if isinstance(xres, tuple) else float(xres)
                     he_pixel_um = (10000.0 / xres) if unit == 3 else (25400.0 / xres)
-                    _log(f"  H&E pixel size from TIFF tags: {he_pixel_um:.4f} µm/px")
+                    _log(f"  H&E pixel size from TIFF tags: {he_pixel_um:.4f} um/px")
                 _img.close()
             except Exception:
                 pass
         if he_pixel_um is None:
             he_pixel_um = 0.2527
-            _log(f"  WARNING: H&E pixel size unknown — assuming {he_pixel_um} µm/px. "
-                 f"Pass he_pixel_um= to override.")
+            _log(f"  WARNING: H&E pixel size unknown, assuming {he_pixel_um} um/px.")
         else:
-            _log(f"  H&E native pixel size: {he_pixel_um:.4f} µm/px")
+            _log(f"  H&E native pixel size: {he_pixel_um:.4f} um/px")
 
     try:
         _he_probe = Image.open(he_path)
@@ -593,7 +622,7 @@ def load_and_align(
     if maldi_pixel_um is None:
         detected = _read_maldi_pixel_size(imzml_path)
         if detected is not None:
-            _log(f"  MALDI pixel size from imzML metadata: {detected} µm/px")
+            _log(f"  MALDI pixel size from imzML metadata: {detected} um/px")
             _p_probe = ImzMLParser(imzml_path)
             _maldi_h = _p_probe.imzmldict.get('max count of pixels y', 1)
             _maldi_w = _p_probe.imzmldict.get('max count of pixels x', 1)
@@ -601,40 +630,34 @@ def load_and_align(
             _he_thumb_h = he_phys_h_um / detected
             if _he_thumb_w >= _maldi_w and _he_thumb_h >= _maldi_h:
                 maldi_pixel_um = detected
-                _log(f"  Validated: H&E thumbnail ({_he_thumb_w:.0f}×{_he_thumb_h:.0f} px) "
-                     f">= MALDI ({_maldi_w}×{_maldi_h} px) ✓")
+                _log(f"  Validated: H&E thumbnail ({_he_thumb_w:.0f}x{_he_thumb_h:.0f} px) "
+                     f">= MALDI ({_maldi_w}x{_maldi_h} px)")
             else:
-                _log(f"  WARNING: imzML pixel size {detected} µm makes H&E thumbnail "
-                     f"({_he_thumb_w:.0f}×{_he_thumb_h:.0f} px) smaller than MALDI "
-                     f"({_maldi_w}×{_maldi_h} px) — this value is likely wrong.")
-                _log(f"  Trying common MALDI pixel sizes …")
+                _log(f"  WARNING: imzML pixel size {detected} um makes H&E thumbnail "
+                     f"({_he_thumb_w:.0f}x{_he_thumb_h:.0f} px) smaller than MALDI "
+                     f"({_maldi_w}x{_maldi_h} px) -- likely wrong.")
                 for candidate in [10.0, 20.0, 50.0, 100.0, 200.0]:
                     _cw = he_phys_w_um / candidate
                     _ch = he_phys_h_um / candidate
                     if _cw >= _maldi_w * 0.5 and _ch >= _maldi_h * 0.5:
                         maldi_pixel_um = candidate
-                        _log(f"  Auto-selected maldi_pixel_um={candidate} µm/px "
-                             f"(H&E thumbnail: {_cw:.0f}×{_ch:.0f} px, "
-                             f"MALDI: {_maldi_w}×{_maldi_h} px)")
+                        _log(f"  Auto-selected maldi_pixel_um={candidate} um/px")
                         break
                 if maldi_pixel_um is None:
                     maldi_pixel_um = 10.0
-                    _log(f"  Falling back to maldi_pixel_um=10.0 µm/px. "
-                         f"Pass maldi_pixel_um= explicitly if wrong.")
+                    _log(f"  Falling back to maldi_pixel_um=10.0 um/px.")
         else:
             maldi_pixel_um = 10.0
-            _log(f"  Pixel size not found in imzML — defaulting to {maldi_pixel_um} µm/px. "
-                 f"Pass maldi_pixel_um= explicitly if wrong.")
+            _log(f"  Pixel size not in imzML, defaulting to {maldi_pixel_um} um/px.")
     else:
-        _log(f"  MALDI pixel size (supplied): {maldi_pixel_um} µm/px")
+        _log(f"  MALDI pixel size (supplied): {maldi_pixel_um} um/px")
 
-    _log(f"  Using maldi_pixel_um={maldi_pixel_um} µm/px  |  he_pixel_um={he_pixel_um:.4f} µm/px")
+    _log(f"  maldi_pixel_um={maldi_pixel_um}  he_pixel_um={he_pixel_um:.4f}")
 
     # ------------------------------------------------------------------
     # 2. MALDI crop offsets
     # ------------------------------------------------------------------
-    _log("Computing MALDI crop offsets …")
-    p         = ImzMLParser(imzml_path)
+    _log("Computing MALDI crop offsets ...")
     tic_probe = np.nansum(
         np.stack([getimage(pk, path=imzml_path) for pk in peaks[:5]], axis=-1),
         axis=-1,
@@ -647,7 +670,7 @@ def load_and_align(
     # ------------------------------------------------------------------
     # 3. Load spectra in chunks
     # ------------------------------------------------------------------
-    _log(f"Loading {len(peaks)} ion images (chunk={spectra_chunk_size}) …")
+    _log(f"Loading {len(peaks)} ion images (chunk={spectra_chunk_size}) ...")
     spectra_all = _load_spectra(
         imzml_path, peaks,
         chunk_size=spectra_chunk_size,
@@ -658,7 +681,7 @@ def load_and_align(
     # ------------------------------------------------------------------
     # 4. MALDI registration image
     # ------------------------------------------------------------------
-    _log("Preparing MALDI template …")
+    _log("Preparing MALDI template ...")
     maldi_tic  = spectra_all.sum(axis=-1).astype(np.float32)
     maldi_gray = _maldi_to_grayscale(maldi_tic)
     del maldi_tic
@@ -667,24 +690,24 @@ def load_and_align(
     # ------------------------------------------------------------------
     # 5. H&E at MALDI native resolution
     # ------------------------------------------------------------------
-    _log(f"Loading H&E at {maldi_pixel_um} µm/px …")
+    _log(f"Loading H&E at {maldi_pixel_um} um/px ...")
     he_img, loaded_mpp = _load_he_at_resolution(he_path, maldi_pixel_um, he_pixel_um)
-    _log(f"  H&E: {he_img.width}×{he_img.height}  ({he_img.width*he_img.height*3/1e6:.0f} MB)")
+    _log(f"  H&E: {he_img.width}x{he_img.height}  ({he_img.width*he_img.height*3/1e6:.0f} MB)")
 
-    # Store H&E size at reg resolution BEFORE rotation — needed by annotation transform
+    # Capture H&E dimensions at reg resolution BEFORE rotation
     he_reg_w = he_img.width
     he_reg_h = he_img.height
 
     # ------------------------------------------------------------------
     # 6. H&E registration image
     # ------------------------------------------------------------------
-    _log("Preparing H&E search image …")
+    _log("Preparing H&E search image ...")
     he_gray = _he_to_grayscale(he_img)
 
     # ------------------------------------------------------------------
     # 7. Two-pass rotation + translation search
     # ------------------------------------------------------------------
-    _log("Running registration …")
+    _log("Running registration ...")
     best_rot, best_idx = _register(
         he_gray, maldi_gray,
         coarse_step=coarse_rotation_step,
@@ -696,10 +719,13 @@ def load_and_align(
     gc.collect()
 
     # ------------------------------------------------------------------
-    # 8. Build full H&E output canvas
+    # 8. Build full H&E output canvas.
+    #    canvas_pr and canvas_pc are captured here directly from PIL's
+    #    integer // 2 arithmetic -- the ground-truth offsets for annotation
+    #    transform, no reconstruction required.
     # ------------------------------------------------------------------
-    _log("Building H&E output canvas …")
-    he_canvas, _, (he_pr, he_pc) = _build_full_output(
+    _log("Building H&E output canvas ...")
+    he_canvas, canvas_pr, canvas_pc = _build_full_output(
         he_img    = he_img,
         rotation  = best_rot,
         buffer_px = buffer_px,
@@ -708,9 +734,30 @@ def load_and_align(
     gc.collect()
 
     # ------------------------------------------------------------------
-    # 9. Assemble SpatialData
+    # 9. Transform annotations while all live values are in scope
     # ------------------------------------------------------------------
-    _log("Building SpatialData …")
+    annotation_gdf = None
+    if geojson_path is not None:
+        _log(f"Transforming annotations from {geojson_path} ...")
+        annotation_gdf = _transform_geojson(
+            geojson_path       = geojson_path,
+            he_pixel_um        = he_pixel_um,
+            reg_mpp            = loaded_mpp,
+            he_reg_w           = he_reg_w,
+            he_reg_h           = he_reg_h,
+            rotation_deg       = best_rot,
+            canvas_pr          = canvas_pr,
+            canvas_pc          = canvas_pc,
+            img_upscaling      = img_upscaling,
+            classification_key = geojson_classification_key,
+        )
+        unique = annotation_gdf[geojson_classification_key].unique().tolist()
+        _log(f"  {len(annotation_gdf)} annotations  |  classes: {unique}")
+
+    # ------------------------------------------------------------------
+    # 10. Assemble SpatialData
+    # ------------------------------------------------------------------
+    _log("Building SpatialData ...")
     sdata = _build_spatialdata(
         spectra_all            = spectra_all,
         peaks                  = peaks,
@@ -723,16 +770,16 @@ def load_and_align(
         img_upscaling          = img_upscaling,
     )
 
+    if annotation_gdf is not None:
+        ann_shapes = ShapesModel.parse(
+            annotation_gdf,
+            transformations={"global": Identity()},
+        )
+        sdata.shapes[geojson_shapes_key] = ann_shapes
+        _log(f"  Annotations added -> sdata.shapes['{geojson_shapes_key}']")
+
     # ------------------------------------------------------------------
-    # 10. Store registration transform
-    #
-    #     he_reg_size and canvas_placement are the critical additions:
-    #       he_reg_size      — H&E pixel dimensions at reg_mpp BEFORE rotation.
-    #                          Used as the rotation origin for annotation coords.
-    #       canvas_placement — exact (pr, pc) integer offsets from _build_full_output
-    #                          where the rotated H&E top-left was placed in the canvas.
-    #                          Storing these directly avoids any floating-point
-    #                          reconstruction of PIL's integer arithmetic.
+    # 11. Store registration transform
     # ------------------------------------------------------------------
     sdata["maldi_adata"].uns["he_transform"] = {
         "rotation_deg":     float(best_rot),
@@ -743,13 +790,11 @@ def load_and_align(
         "buffer_px":        int(buffer_px),
         "img_upscaling":    int(img_upscaling),
         "canvas_shape":     list(he_canvas.shape[:2]),
-        # H&E size at reg_mpp resolution, BEFORE rotation (height, width)
         "he_reg_size":      [int(he_reg_h), int(he_reg_w)],
-        # Exact integer offsets where the rotated H&E was placed in the canvas
-        "canvas_placement": [int(he_pr), int(he_pc)],
+        "canvas_placement": [int(canvas_pr), int(canvas_pc)],
     }
-    _log(f"  Transform stored in sdata['maldi_adata'].uns['he_transform']")
-    _log(f"  he_reg_size={[he_reg_h, he_reg_w]}  canvas_placement={[he_pr, he_pc]}")
+    _log(f"  Transform stored: he_reg_size={[he_reg_h, he_reg_w]}  "
+         f"canvas_placement={[canvas_pr, canvas_pc]}")
 
     _log("Done.")
     return sdata

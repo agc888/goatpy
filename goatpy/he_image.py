@@ -44,7 +44,7 @@ def he_spatialdata(he_image_path, backend = 'tiffslide'):
     return sdata
 
 
-def add_qupath_annotations(sdata, geojson_path, name = "Annotations"):
+def add_annotations(sdata, geojson_path, name = "Annotations"):
     
     gdf = gpd.read_file(geojson_path)   
     gdf["colour"] = gdf["classification"].apply(lambda x: x["color"])
