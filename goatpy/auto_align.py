@@ -15,8 +15,21 @@ Key design decisions
     slide orientation without assuming any starting angle.
 
 4.  Optional QuPath GeoJSON annotations can be passed via geojson_path.
-    They are transformed at the exact moment the H&E canvas is built,
-    using the live PIL rotation values so no reconstruction is needed.
+    They are transformed using the same cv2.warpAffine matrix used to build
+    the H&E canvas, guaranteeing pixel-perfect consistency between the image
+    and annotation coordinate systems.
+
+Annotation transform approach
+------------------------------
+The H&E canvas is built with cv2.warpAffine using an analytically derived
+affine matrix (rotate around image centre, remove bounding-box shift, add
+canvas placement offset).  The same matrix is applied to annotation vertices,
+so the two are guaranteed to be consistent -- no PIL internals, no
+reconstruction, no least-squares fitting required.
+
+    Image:       cv2.warpAffine(img, M_stored[:2,:], (canvas_w, canvas_h))
+    Annotations: M_full = M_up @ M_stored @ M_scale
+                 applied per-vertex to GeoJSON coordinates
 """
 
 from __future__ import annotations
@@ -35,9 +48,7 @@ import geopandas as gpd
 import cv2 as cv
 from PIL import Image
 from shapely.geometry import box, shape
-from shapely.affinity import rotate as shapely_rotate
-from shapely.affinity import scale as shapely_scale
-from shapely.affinity import translate
+from shapely import transform as shapely_transform
 
 from spatialdata import SpatialData
 from spatialdata.models import Image2DModel, PointsModel, ShapesModel, TableModel
@@ -281,6 +292,109 @@ def _register(he_gray: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Build H&E canvas with cv2.warpAffine + derive affine matrix
+# ---------------------------------------------------------------------------
+
+def _build_affine_and_canvas(
+    he_img: Image.Image,
+    src_w: int,
+    src_h: int,
+    rotation_deg: float,
+    buffer_px: int,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """
+    Build the H&E output canvas using cv2.warpAffine and return the affine
+    matrix M_stored so that annotations can use the identical transform.
+
+    By using cv2.warpAffine for both the image and the annotations (via
+    _transform_geojson), the two are guaranteed to be consistent -- no PIL
+    internals, no reconstruction, no least-squares fitting required.
+
+    The affine encodes:
+        1. CCW rotate around image centre  ((src_w-1)/2, (src_h-1)/2)
+        2. Subtract bounding-box min of rotated corners  (expand-equivalent)
+        3. Centre in buffer canvas  (canvas_pc, canvas_pr)
+
+    Parameters
+    ----------
+    he_img       : PIL Image at reg_mpp resolution
+    src_w, src_h : image dimensions (he_img.width, he_img.height)
+    rotation_deg : CCW rotation in degrees
+    buffer_px    : padding added around the rotated image
+
+    Returns
+    -------
+    canvas    : np.ndarray (H, W, 3) uint8 -- final H&E canvas
+    M_stored  : np.ndarray (3, 3) float64  -- reg-res coords -> canvas coords
+    canvas_pr : int -- row offset for backward-compat storage
+    canvas_pc : int -- col offset for backward-compat storage
+    """
+    theta = np.deg2rad(rotation_deg)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+
+    # Use pixel-centre convention (matches cv2 and PIL exactly)
+    cx = (src_w - 1) / 2.0
+    cy = (src_h - 1) / 2.0
+
+    # Compute where the four corners land after rotation around (cx, cy)
+    corners = np.array([
+        [0.0,        0.0       ],
+        [src_w - 1,  0.0       ],
+        [src_w - 1,  src_h - 1],
+        [0.0,        src_h - 1],
+    ], dtype=np.float64)
+
+    dx = corners[:, 0] - cx
+    dy = corners[:, 1] - cy
+    rot_x = cos_t * dx - sin_t * dy + cx
+    rot_y = sin_t * dx + cos_t * dy + cy
+
+    # Bounding-box shift so rotated content starts at (0, 0)
+    expand_x = rot_x.min()
+    expand_y = rot_y.min()
+
+    # Canvas size: tight fit around rotated image + buffer
+    rot_w = int(np.ceil(rot_x.max() - rot_x.min()))
+    rot_h = int(np.ceil(rot_y.max() - rot_y.min()))
+    canvas_w = rot_w + buffer_px
+    canvas_h = rot_h + buffer_px
+
+    # Centre the rotated image in the canvas
+    canvas_pc = (canvas_w - rot_w) // 2
+    canvas_pr = (canvas_h - rot_h) // 2
+
+    # Affine matrix: reg-res H&E coords -> canvas coords
+    # x' = cos_t*(x-cx) - sin_t*(y-cy) + cx - expand_x + canvas_pc
+    # y' = sin_t*(x-cx) + cos_t*(y-cy) + cy - expand_y + canvas_pr
+    tx = -cos_t * cx + sin_t * cy + cx - expand_x + canvas_pc
+    ty = -sin_t * cx - cos_t * cy + cy - expand_y + canvas_pr
+
+    M_stored = np.array([
+        [ cos_t, -sin_t, tx],
+        [ sin_t,  cos_t, ty],
+        [   0.0,    0.0, 1.0],
+    ], dtype=np.float64)
+
+    # Build canvas with cv2.warpAffine (identical transform used for annotations)
+    img_np = np.array(he_img, dtype=np.uint8)
+    M_cv   = M_stored[:2, :]  # cv2 takes the 2x3 sub-matrix
+    canvas = cv.warpAffine(
+        img_np,
+        M_cv,
+        (canvas_w, canvas_h),
+        flags=cv.INTER_LINEAR,
+        borderValue=(0, 0, 0),
+    )
+
+    _log(f"  H&E canvas (cv2): {canvas_w}x{canvas_h}  "
+         f"pr={canvas_pr}, pc={canvas_pc}  "
+         f"rotation={rotation_deg}  tx={tx:.3f}, ty={ty:.3f}")
+
+    return canvas, M_stored, canvas_pr, canvas_pc
+
+
+# ---------------------------------------------------------------------------
 # Annotation transform
 # ---------------------------------------------------------------------------
 
@@ -288,36 +402,37 @@ def _transform_geojson(
     geojson_path: Union[str, Path],
     he_pixel_um: float,
     reg_mpp: float,
-    he_reg_w: int,
-    he_reg_h: int,
-    rotation_deg: float,
-    canvas_pr: int,
-    canvas_pc: int,
+    M_stored: np.ndarray,
     img_upscaling: int,
     classification_key: str = "classification",
 ) -> gpd.GeoDataFrame:
     """
-    Transform QuPath GeoJSON annotations into the aligned canvas coordinate
-    system using values captured directly from the PIL rotation step.
+    Transform QuPath GeoJSON annotations (native H&E pixel coords) into the
+    final upscaled canvas coordinate system.
+
+    Uses the same affine matrix that cv2.warpAffine used to build the H&E
+    canvas, so image and annotations are guaranteed to be consistent.
+
+    Full pipeline (matches working verification script exactly):
+        M_annotations = M_up @ M_stored @ M_scale
+
+    where:
+        M_scale   scales native H&E pixels -> reg-resolution pixels
+        M_stored  maps reg-res coords -> canvas coords  (from _build_affine_and_canvas)
+        M_up      scales canvas coords -> upscaled canvas coords
 
     Parameters
     ----------
-    geojson_path   : path to QuPath GeoJSON (native H&E pixel coords)
-    he_pixel_um    : native H&E pixel size (um/px)
-    reg_mpp        : registration resolution (um/px)
-    he_reg_w       : H&E width  at reg_mpp BEFORE rotation
-    he_reg_h       : H&E height at reg_mpp BEFORE rotation
-    rotation_deg   : CCW rotation applied by PIL
-    canvas_pr      : row offset of rotated H&E top-left in canvas (from PIL directly)
-    canvas_pc      : col offset of rotated H&E top-left in canvas (from PIL directly)
-    img_upscaling  : upscaling factor matching the stored H&E image
+    geojson_path      : path to QuPath GeoJSON (native H&E pixel coords)
+    he_pixel_um       : native H&E pixel size (um/px)
+    reg_mpp           : registration resolution (um/px)
+    M_stored          : 3x3 affine from _build_affine_and_canvas
+    img_upscaling     : upscaling factor matching the stored H&E image
+    classification_key: column name for QuPath class labels
 
-    Pipeline per geometry
-    ---------------------
-    1. Scale     : native H&E px -> reg_mpp  (factor = he_pixel_um / reg_mpp)
-    2. Rotate    : CCW around centre of pre-rotation H&E (he_reg_w/2, he_reg_h/2)
-    3. Translate : shift by (canvas_pc, canvas_pr) -- exact integers from PIL
-    4. Upscale   : multiply by img_upscaling
+    Returns
+    -------
+    GeoDataFrame with transformed geometries
     """
     with open(geojson_path, "r") as f:
         geojson = json.load(f)
@@ -326,89 +441,49 @@ def _transform_geojson(
     if not features:
         raise ValueError(f"No features found in {geojson_path}")
 
-    scale_factor = he_pixel_um / reg_mpp
-    cx = he_reg_w / 2.0
-    cy = he_reg_h / 2.0
+    scale_to_reg = he_pixel_um / reg_mpp
+    us           = float(img_upscaling)
 
-    geoms  = []
-    labels = []
-    names  = []
+    M_scale = np.array([
+        [scale_to_reg, 0.0,          0.0],
+        [0.0,          scale_to_reg, 0.0],
+        [0.0,          0.0,          1.0],
+    ], dtype=np.float64)
 
+    M_up = np.array([
+        [us,  0.0, 0.0],
+        [0.0, us,  0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+
+    # Combined single-pass matrix: native px -> upscaled canvas
+    M = M_up @ M_stored @ M_scale
+
+    a, b, tx = M[0, 0], M[0, 1], M[0, 2]
+    d, e, ty = M[1, 0], M[1, 1], M[1, 2]
+
+    def _apply(coords: np.ndarray) -> np.ndarray:
+        x, y = coords[:, 0], coords[:, 1]
+        return np.column_stack([
+            a * x + b * y + tx,
+            d * x + e * y + ty,
+        ])
+
+    geoms, labels, names = [], [], []
     for feat in features:
         geom_raw = feat.get("geometry")
         if geom_raw is None:
             continue
-
-        geom = shape(geom_raw)
-
-        # 1. Scale to registration resolution
-        geom = shapely_scale(geom, xfact=scale_factor, yfact=scale_factor,
-                             origin=(0, 0))
-
-        # 2. Rotate CCW around the centre of the pre-rotation H&E image.
-        #    PIL rotates around (width/2, height/2) before expand=True enlarges
-        #    the canvas -- shapely uses (x=col, y=row) so origin=(cx, cy).
-        geom = shapely_rotate(geom, angle=rotation_deg, origin=(cx, cy),
-                              use_radians=False)
-
-        # 3. Translate by the canvas placement offsets captured directly from
-        #    PIL's integer // 2 arithmetic in _build_full_output.
-        #    No formula reconstruction -- these are the exact same integers.
-        geom = translate(geom, xoff=canvas_pc, yoff=canvas_pr)
-
-        # 4. Upscale to match the stored H&E image
-        geom = shapely_scale(geom, xfact=img_upscaling, yfact=img_upscaling,
-                             origin=(0, 0))
-
-        geoms.append(geom)
-
-        props = feat.get("properties") or {}
-        clf   = props.get("classification") or {}
-        label = clf.get("name", "unknown") if isinstance(clf, dict) else str(clf)
-        name  = props.get("name", "")
-        labels.append(label)
-        names.append(name)
+        geoms.append(shapely_transform(shape(geom_raw), _apply))
+        props  = feat.get("properties") or {}
+        clf    = props.get("classification") or {}
+        labels.append(clf.get("name", "unknown") if isinstance(clf, dict) else str(clf))
+        names.append(props.get("name", ""))
 
     return gpd.GeoDataFrame(
         {classification_key: labels, "name": names},
         geometry=geoms,
     )
-
-
-# ---------------------------------------------------------------------------
-# Output: build full H&E canvas
-# ---------------------------------------------------------------------------
-
-def _build_full_output(he_img: Image.Image,
-                        rotation: float,
-                        buffer_px: int) -> tuple[np.ndarray, int, int]:
-    """
-    Rotate the H&E thumbnail and place it centred in a zero-padded canvas.
-
-    Returns
-    -------
-    canvas : np.ndarray (H, W, 3) uint8
-    pr     : int  -- row offset where rotated H&E top-left was placed
-    pc     : int  -- col offset where rotated H&E top-left was placed
-    """
-    canvas_h = he_img.height + buffer_px
-    canvas_w = he_img.width  + buffer_px
-
-    he_rot  = he_img.rotate(rotation, expand=True, resample=Image.Resampling.BILINEAR)
-    rh, rw  = he_rot.height, he_rot.width
-    pr      = max(0, (canvas_h - rh) // 2)
-    pc      = max(0, (canvas_w - rw) // 2)
-    use_h   = min(rh, canvas_h - pr)
-    use_w   = min(rw, canvas_w - pc)
-
-    canvas  = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-    rot_arr = np.array(he_rot, dtype=np.uint8)
-    canvas[pr: pr + use_h, pc: pc + use_w] = rot_arr[:use_h, :use_w]
-    del he_rot, rot_arr
-
-    _log(f"  H&E canvas: {canvas_w}x{canvas_h}  ({canvas.nbytes/1e6:.0f} MB)")
-    _log(f"  Rotated H&E placed at pr={pr}, pc={pc}  (rotated size: {rw}x{rh})")
-    return canvas, pr, pc
 
 
 # ---------------------------------------------------------------------------
@@ -541,9 +616,9 @@ def load_and_align(
     geojson_path : str, Path, or None
         Optional path to a QuPath GeoJSON annotation export.  Coordinates
         must be in native H&E pixel space (QuPath default).
-        Annotations are transformed at registration time using the live PIL
-        values so no reconstruction of the coordinate transform is needed.
-        Result is stored in sdata.shapes[geojson_shapes_key].
+        Annotations are transformed using the same cv2.warpAffine matrix
+        used to build the H&E canvas, guaranteeing consistency.
+        Result stored in sdata.shapes[geojson_shapes_key].
     geojson_shapes_key : str, default "annotations"
         Key under which annotations are stored in sdata.shapes.
     geojson_classification_key : str, default "classification"
@@ -719,35 +794,32 @@ def load_and_align(
     gc.collect()
 
     # ------------------------------------------------------------------
-    # 8. Build full H&E output canvas.
-    #    canvas_pr and canvas_pc are captured here directly from PIL's
-    #    integer // 2 arithmetic -- the ground-truth offsets for annotation
-    #    transform, no reconstruction required.
+    # 8. Build H&E output canvas using cv2.warpAffine.
+    #    M_stored is the affine matrix that will also be used for
+    #    annotations -- single source of truth, no PIL involved.
     # ------------------------------------------------------------------
     _log("Building H&E output canvas ...")
-    he_canvas, canvas_pr, canvas_pc = _build_full_output(
-        he_img    = he_img,
-        rotation  = best_rot,
-        buffer_px = buffer_px,
+    he_canvas, M_stored, canvas_pr, canvas_pc = _build_affine_and_canvas(
+        he_img       = he_img,
+        src_w        = he_reg_w,
+        src_h        = he_reg_h,
+        rotation_deg = best_rot,
+        buffer_px    = buffer_px,
     )
     del he_img
     gc.collect()
 
     # ------------------------------------------------------------------
-    # 9. Transform annotations while all live values are in scope
+    # 9. Transform annotations using the same affine matrix.
     # ------------------------------------------------------------------
     annotation_gdf = None
     if geojson_path is not None:
-        _log(f"Transforming annotations from {geojson_path} ...")
+        _log(f"Transforming annotations: {geojson_path} ...")
         annotation_gdf = _transform_geojson(
             geojson_path       = geojson_path,
             he_pixel_um        = he_pixel_um,
             reg_mpp            = loaded_mpp,
-            he_reg_w           = he_reg_w,
-            he_reg_h           = he_reg_h,
-            rotation_deg       = best_rot,
-            canvas_pr          = canvas_pr,
-            canvas_pc          = canvas_pc,
+            M_stored           = M_stored,
             img_upscaling      = img_upscaling,
             classification_key = geojson_classification_key,
         )
@@ -779,7 +851,11 @@ def load_and_align(
         _log(f"  Annotations added -> sdata.shapes['{geojson_shapes_key}']")
 
     # ------------------------------------------------------------------
-    # 11. Store registration transform
+    # 11. Store registration transform.
+    #
+    #     affine_matrix: 3x3 float64, maps reg-resolution H&E coords ->
+    #     canvas coords (before upscaling).  annotation.py composes
+    #     M_up @ affine_matrix @ M_scale to get native px -> upscaled canvas.
     # ------------------------------------------------------------------
     sdata["maldi_adata"].uns["he_transform"] = {
         "rotation_deg":     float(best_rot),
@@ -792,8 +868,10 @@ def load_and_align(
         "canvas_shape":     list(he_canvas.shape[:2]),
         "he_reg_size":      [int(he_reg_h), int(he_reg_w)],
         "canvas_placement": [int(canvas_pr), int(canvas_pc)],
+        "affine_matrix":    M_stored.tolist(),
     }
-    _log(f"  Transform stored: he_reg_size={[he_reg_h, he_reg_w]}  "
+    _log(f"  Transform stored: rotation={best_rot}  "
+         f"he_reg_size={[he_reg_h, he_reg_w]}  "
          f"canvas_placement={[canvas_pr, canvas_pc]}")
 
     _log("Done.")

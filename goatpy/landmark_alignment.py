@@ -190,8 +190,14 @@ def align_image_using_landmarks(
         target_coordinate_system="aligned",
     )
 
-    he_image = he_sd.images[he_image_key]
-    maldi_sd.images[he_image_key] = he_image
+    #he_image = he_sd.images[he_image_key]
+    #maldi_sd.images[he_image_key] = he_image
+
+    for attr in ["images", "labels", "points", "shapes", "tables"]:
+        source = getattr(he_sd, attr)
+        target = getattr(maldi_sd, attr)
+        for key, val in source.items():
+            target[key] = val
 
     return maldi_sd
 
