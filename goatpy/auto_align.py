@@ -847,7 +847,9 @@ def load_and_align(
             annotation_gdf,
             transformations={"global": Identity()},
         )
+        ann_shapes[geojson_classification_key] = ann_shapes[geojson_classification_key].astype("category")
         sdata.shapes[geojson_shapes_key] = ann_shapes
+
         _log(f"  Annotations added -> sdata.shapes['{geojson_shapes_key}']")
 
     # ------------------------------------------------------------------
