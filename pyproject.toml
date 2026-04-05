@@ -4,14 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "goatpy"
-version = "0.0.1"
-description = "Spatial glycomics analysis toolkit using SpatialData and H&E-driven single-cell inference."
+version = "0.1.0"
+description = "Spatial Glycomics Analysis Toolkit — MALDI imaging + H&E registration and analysis."
 authors = [
-  { name = "Andrew Causer" }
+  { name = "Andrew Causer", email = "causer.ag@gmail.com" }
 ]
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
+keywords = ["spatial", "glycomics", "MALDI", "imaging", "spatialdata", "H&E", "registration"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
 
 dependencies = [
   "numpy>=2.2",
@@ -21,11 +32,43 @@ dependencies = [
   "spatialdata-io>=0.3",
   "tifffile>=2025.5",
   "scanpy>=1.11",
-  "squidpy>=1.6"
+  "squidpy>=1.6",
+  "geopandas>=1.0",
+  "shapely>=2.0",
+  "opencv-python>=4.8",
+  "pillow>=10.0",
+  "pyimzml>=1.5",
+  "joblib>=1.3",
+  "scipy>=1.11",
+  "scikit-learn>=1.3",
+  "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+napari = [
+  "napari>=0.4.19",
+  "napari-spatialdata>=0.5",
+  "pyqt5>=5.15",
+]
+docs = [
+  "sphinx>=7.0",
+  "sphinx-rtd-theme>=2.0",
+  "sphinx-autoapi>=3.0",
+  "myst-parser>=2.0",
+  "nbsphinx>=0.9",
+]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "black>=23.0",
+  "ruff>=0.1",
 ]
 
 [project.urls]
-homepage = "https://github.com/agc888/goatpy"
+Homepage = "https://github.com/agc888/goatpy"
+Documentation = "https://goatpy.readthedocs.io"
+Repository = "https://github.com/agc888/goatpy"
+"Bug Tracker" = "https://github.com/agc888/goatpy/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
