@@ -53,6 +53,15 @@ html_theme_options = {
     'sticky_navigation': True,
     'includehidden': True,
 }
+
+html_context = {
+    "display_github": True,
+    "github_user": "agc888",
+    "github_repo": "goatpy",
+    "github_version": "main",
+    "conf_py_path": "/docs/source/",
+}
+
 html_static_path = ['_static']
 html_logo = "_static/logo.png"
 html_show_sourcelink = True
