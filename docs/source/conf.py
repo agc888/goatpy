@@ -48,12 +48,13 @@ exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 html_theme = 'sphinx_rtd_theme'
 html_theme_options = {
     'navigation_depth': 4,
+    "logo_only": True,
     'collapse_navigation': False,
     'sticky_navigation': True,
     'includehidden': True,
 }
 html_static_path = ['_static']
-html_logo = None
+html_logo = "_static/logo.png"
 html_show_sourcelink = True
 
 source_suffix = {

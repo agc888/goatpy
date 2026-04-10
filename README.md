@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/agc888/goatpy/main/docs/source/_static/logo.png" width="200">
+</p>
+
 # goatpy — Spatial Glycomics Analysis Toolkit
 
 [![PyPI version](https://badge.fury.io/py/goatpy.svg)](https://badge.fury.io/py/goatpy)

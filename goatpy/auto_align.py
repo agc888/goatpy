@@ -14,22 +14,23 @@ Key design decisions
 3.  A two-pass rotation search (coarse 0-360, then fine) finds the correct
     slide orientation without assuming any starting angle.
 
-4.  Optional QuPath GeoJSON annotations can be passed via geojson_path.
-    They are transformed using the same cv2.warpAffine matrix used to build
-    the H&E canvas, guaranteeing pixel-perfect consistency between the image
-    and annotation coordinate systems.
+4.  Registration, canvas building, and annotation transforms all use
+    cv2.warpAffine with the same analytically derived affine matrix.
+    This guarantees that best_idx, canvas pixels, and annotation coordinates
+    all live in the same coordinate system.
 
-Annotation transform approach
-------------------------------
-The H&E canvas is built with cv2.warpAffine using an analytically derived
-affine matrix (rotate around image centre, remove bounding-box shift, add
-canvas placement offset).  The same matrix is applied to annotation vertices,
-so the two are guaranteed to be consistent -- no PIL internals, no
-reconstruction, no least-squares fitting required.
+Coordinate system
+-----------------
+All three steps share the same affine matrix M_stored:
 
-    Image:       cv2.warpAffine(img, M_stored[:2,:], (canvas_w, canvas_h))
-    Annotations: M_full = M_up @ M_stored @ M_scale
-                 applied per-vertex to GeoJSON coordinates
+    M_stored maps: reg-resolution H&E coords -> canvas coords
+
+    _match_at_rotation  uses cv2.warpAffine(M_stored) to build the search canvas
+    _build_affine_and_canvas uses cv2.warpAffine(M_stored) to build output canvas
+    _transform_geojson  applies M_up @ M_stored @ M_scale to annotation vertices
+
+Because the same matrix is used everywhere, best_idx from matchTemplate is
+directly valid as the MALDI placement offset in the output canvas.
 """
 
 from __future__ import annotations
@@ -218,47 +219,163 @@ def _he_to_grayscale(he_img: Image.Image) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Registration
+# Affine matrix construction (shared by registration and canvas building)
 # ---------------------------------------------------------------------------
 
-def _match_at_rotation(he_gray: np.ndarray,
-                        maldi_gray: np.ndarray,
-                        rotation: float,
-                        canvas_shape: tuple[int, int]) -> tuple[float, tuple[int, int]]:
-    he_pil  = Image.fromarray((he_gray * 255).astype(np.uint8))
-    rot_pil = he_pil.rotate(rotation, expand=True, resample=Image.Resampling.BILINEAR)
-    rot_arr = np.array(rot_pil, dtype=np.float32) / 255.0
+def _build_affine_matrix(
+    src_w: int,
+    src_h: int,
+    rotation_deg: float,
+    buffer_px: int,
+    min_w: int = 0,
+    min_h: int = 0,
+) -> tuple[np.ndarray, int, int, int, int]:
+    """
+    Compute the affine matrix that:
+        1. Rotates CCW around the image centre ((src_w-1)/2, (src_h-1)/2)
+        2. Shifts so the rotated bounding box starts at (0, 0)
+        3. Centres the result in a buffer canvas, which is guaranteed to be
+           at least (min_w, min_h) pixels so matchTemplate never fails.
 
-    rh, rw = rot_arr.shape
-    canvas = np.zeros(canvas_shape, dtype=np.float32)
-    pr     = max(0, (canvas_shape[0] - rh) // 2)
-    pc     = max(0, (canvas_shape[1] - rw) // 2)
-    use_h  = min(rh, canvas_shape[0] - pr)
-    use_w  = min(rw, canvas_shape[1] - pc)
-    canvas[pr: pr + use_h, pc: pc + use_w] = rot_arr[:use_h, :use_w]
+    This function is called by both _match_at_rotation (registration) and
+    _build_affine_and_canvas (output), so both steps share the identical
+    coordinate system and best_idx is directly valid in the output canvas.
 
-    if canvas.shape[0] < maldi_gray.shape[0] or canvas.shape[1] < maldi_gray.shape[1]:
-        raise ValueError(
-            f"H&E canvas ({canvas.shape[1]}x{canvas.shape[0]} px) is smaller than "
-            f"MALDI template ({maldi_gray.shape[1]}x{maldi_gray.shape[0]} px).\n"
-            f"Try passing maldi_pixel_um=10 or maldi_pixel_um=20 explicitly."
-        )
+    Parameters
+    ----------
+    src_w, src_h  : H&E image dimensions at registration resolution
+    rotation_deg  : CCW rotation in degrees
+    buffer_px     : symmetric padding added around the rotated image
+    min_w, min_h  : minimum canvas dimensions (set to MALDI template size
+                    during registration to guarantee matchTemplate succeeds
+                    at all rotation angles including 90/270 degree flips)
+
+    Returns
+    -------
+    M_stored  : np.ndarray (3, 3) -- reg-res H&E coords -> canvas coords
+    canvas_w  : int
+    canvas_h  : int
+    canvas_pc : int -- col offset
+    canvas_pr : int -- row offset
+    """
+    theta = np.deg2rad(rotation_deg)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+
+    cx = (src_w - 1) / 2.0
+    cy = (src_h - 1) / 2.0
+
+    corners = np.array([
+        [0.0,       0.0      ],
+        [src_w - 1, 0.0      ],
+        [src_w - 1, src_h - 1],
+        [0.0,       src_h - 1],
+    ], dtype=np.float64)
+
+    dx = corners[:, 0] - cx
+    dy = corners[:, 1] - cy
+    rot_x = cos_t * dx - sin_t * dy + cx
+    rot_y = sin_t * dx + cos_t * dy + cy
+
+    expand_x = rot_x.min()
+    expand_y = rot_y.min()
+
+    rot_w = int(np.ceil(rot_x.max() - rot_x.min()))
+    rot_h = int(np.ceil(rot_y.max() - rot_y.min()))
+
+    # Guarantee the canvas is large enough for the MALDI template at all
+    # rotation angles. At 90/270 degrees the rotated H&E bounding box swaps
+    # width and height, which can make the canvas narrower than the template.
+    # We expand symmetrically so the affine translation stays centred.
+    canvas_w  = max(rot_w + buffer_px, min_w)
+    canvas_h  = max(rot_h + buffer_px, min_h)
+    canvas_pc = (canvas_w - rot_w) // 2
+    canvas_pr = (canvas_h - rot_h) // 2
+
+    tx = -cos_t * cx + sin_t * cy + cx - expand_x + canvas_pc
+    ty = -sin_t * cx - cos_t * cy + cy - expand_y + canvas_pr
+
+    M_stored = np.array([
+        [ cos_t, -sin_t, tx],
+        [ sin_t,  cos_t, ty],
+        [   0.0,    0.0, 1.0],
+    ], dtype=np.float64)
+
+    return M_stored, canvas_w, canvas_h, canvas_pc, canvas_pr
+
+
+# ---------------------------------------------------------------------------
+# Registration — now using cv2 so coordinate system matches canvas building
+# ---------------------------------------------------------------------------
+
+def _match_at_rotation(
+    he_gray: np.ndarray,
+    maldi_gray: np.ndarray,
+    rotation: float,
+    buffer_px: int,
+) -> tuple[float, tuple[int, int]]:
+    """
+    Rotate the H&E grayscale image using the same cv2.warpAffine convention
+    as _build_affine_and_canvas, then run matchTemplate.
+
+    Because the rotation is applied identically here and in the output canvas
+    builder, best_idx returned here is directly valid as the MALDI placement
+    offset in the final canvas — no coordinate remapping needed.
+
+    Parameters
+    ----------
+    he_gray    : float32 grayscale H&E at reg resolution
+    maldi_gray : float32 grayscale MALDI TIC template
+    rotation   : CCW rotation in degrees
+    buffer_px  : canvas padding — must match _build_affine_and_canvas
+
+    Returns
+    -------
+    score  : float, normalised cross-correlation score
+    loc    : (row, col) top-left of best template match in canvas coords
+    """
+    src_h, src_w = he_gray.shape
+    tmpl_h, tmpl_w = maldi_gray.shape
+
+    # Pass template dimensions as minimum canvas size so the canvas is always
+    # large enough for matchTemplate at every rotation angle, including 90/270
+    # degree cases where the rotated H&E bounding box swaps width and height.
+    M_stored, canvas_w, canvas_h, _, _ = _build_affine_matrix(
+        src_w, src_h, rotation, buffer_px,
+        min_w=tmpl_w, min_h=tmpl_h,
+    )
+
+    M_cv = M_stored[:2, :]
+    canvas = cv.warpAffine(
+        he_gray,
+        M_cv,
+        (canvas_w, canvas_h),
+        flags=cv.INTER_LINEAR,
+        borderValue=0.0,
+    )
 
     result           = cv.matchTemplate(canvas, maldi_gray, cv.TM_CCOEFF_NORMED)
     _, score, _, loc = cv.minMaxLoc(result)
-    return float(score), (int(loc[1]), int(loc[0]))
+    return float(score), (int(loc[1]), int(loc[0]))   # (row, col)
 
 
-def _register(he_gray: np.ndarray,
-              maldi_gray: np.ndarray,
-              coarse_step: int = 15,
-              fine_range: float = 5.0,
-              fine_step: float = 1.0,
-              buffer_px: int = 150) -> tuple[float, tuple[int, int]]:
-    canvas_h     = he_gray.shape[0] + buffer_px
-    canvas_w     = he_gray.shape[1] + buffer_px
-    canvas_shape = (canvas_h, canvas_w)
+def _register(
+    he_gray: np.ndarray,
+    maldi_gray: np.ndarray,
+    src_w: int,
+    src_h: int,
+    coarse_step: int = 15,
+    fine_range: float = 5.0,
+    fine_step: float = 1.0,
+    buffer_px: int = 150,
+) -> tuple[float, tuple[int, int]]:
+    """
+    Two-pass rotation + translation search using cv2-based matching.
 
+    src_w and src_h are passed explicitly (they equal he_gray.shape[1] and
+    he_gray.shape[0]) so that _build_affine_matrix can be called with the
+    same values used later by _build_affine_and_canvas.
+    """
     coarse_rots = list(range(0, 360, coarse_step))
     _log(f"  Coarse: {len(coarse_rots)} rotations (0-360 step {coarse_step}) ...")
 
@@ -267,7 +384,7 @@ def _register(he_gray: np.ndarray,
     best_idx   = (0, 0)
 
     for rot in coarse_rots:
-        score, idx = _match_at_rotation(he_gray, maldi_gray, rot, canvas_shape)
+        score, idx = _match_at_rotation(he_gray, maldi_gray, rot, buffer_px)
         _log(f"    {rot:5.1f}  score={score:.4f}")
         if score > best_score:
             best_score, best_rot, best_idx = score, float(rot), idx
@@ -282,7 +399,7 @@ def _register(he_gray: np.ndarray,
     _log(f"  Fine: {len(fine_rots)} rotations (+-{fine_range} step {fine_step}) ...")
 
     for rot in fine_rots:
-        score, idx = _match_at_rotation(he_gray, maldi_gray, rot, canvas_shape)
+        score, idx = _match_at_rotation(he_gray, maldi_gray, rot, buffer_px)
         _log(f"    {rot:5.1f}  score={score:.4f}")
         if score > best_score:
             best_score, best_rot, best_idx = score, rot, idx
@@ -292,7 +409,7 @@ def _register(he_gray: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Build H&E canvas with cv2.warpAffine + derive affine matrix
+# Build H&E output canvas
 # ---------------------------------------------------------------------------
 
 def _build_affine_and_canvas(
@@ -303,82 +420,25 @@ def _build_affine_and_canvas(
     buffer_px: int,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
     """
-    Build the H&E output canvas using cv2.warpAffine and return the affine
-    matrix M_stored so that annotations can use the identical transform.
+    Build the H&E output canvas using cv2.warpAffine.
 
-    By using cv2.warpAffine for both the image and the annotations (via
-    _transform_geojson), the two are guaranteed to be consistent -- no PIL
-    internals, no reconstruction, no least-squares fitting required.
-
-    The affine encodes:
-        1. CCW rotate around image centre  ((src_w-1)/2, (src_h-1)/2)
-        2. Subtract bounding-box min of rotated corners  (expand-equivalent)
-        3. Centre in buffer canvas  (canvas_pc, canvas_pr)
-
-    Parameters
-    ----------
-    he_img       : PIL Image at reg_mpp resolution
-    src_w, src_h : image dimensions (he_img.width, he_img.height)
-    rotation_deg : CCW rotation in degrees
-    buffer_px    : padding added around the rotated image
+    Calls _build_affine_matrix with the identical arguments used in
+    _match_at_rotation, so the canvas geometry here is byte-for-byte the
+    same as the search canvas used during registration.
 
     Returns
     -------
-    canvas    : np.ndarray (H, W, 3) uint8 -- final H&E canvas
-    M_stored  : np.ndarray (3, 3) float64  -- reg-res coords -> canvas coords
-    canvas_pr : int -- row offset for backward-compat storage
-    canvas_pc : int -- col offset for backward-compat storage
+    canvas    : np.ndarray (H, W, 3) uint8
+    M_stored  : np.ndarray (3, 3) float64 -- reg-res coords -> canvas coords
+    canvas_pr : int
+    canvas_pc : int
     """
-    theta = np.deg2rad(rotation_deg)
-    cos_t = np.cos(theta)
-    sin_t = np.sin(theta)
+    M_stored, canvas_w, canvas_h, canvas_pc, canvas_pr = _build_affine_matrix(
+        src_w, src_h, rotation_deg, buffer_px
+    )
 
-    # Use pixel-centre convention (matches cv2 and PIL exactly)
-    cx = (src_w - 1) / 2.0
-    cy = (src_h - 1) / 2.0
-
-    # Compute where the four corners land after rotation around (cx, cy)
-    corners = np.array([
-        [0.0,        0.0       ],
-        [src_w - 1,  0.0       ],
-        [src_w - 1,  src_h - 1],
-        [0.0,        src_h - 1],
-    ], dtype=np.float64)
-
-    dx = corners[:, 0] - cx
-    dy = corners[:, 1] - cy
-    rot_x = cos_t * dx - sin_t * dy + cx
-    rot_y = sin_t * dx + cos_t * dy + cy
-
-    # Bounding-box shift so rotated content starts at (0, 0)
-    expand_x = rot_x.min()
-    expand_y = rot_y.min()
-
-    # Canvas size: tight fit around rotated image + buffer
-    rot_w = int(np.ceil(rot_x.max() - rot_x.min()))
-    rot_h = int(np.ceil(rot_y.max() - rot_y.min()))
-    canvas_w = rot_w + buffer_px
-    canvas_h = rot_h + buffer_px
-
-    # Centre the rotated image in the canvas
-    canvas_pc = (canvas_w - rot_w) // 2
-    canvas_pr = (canvas_h - rot_h) // 2
-
-    # Affine matrix: reg-res H&E coords -> canvas coords
-    # x' = cos_t*(x-cx) - sin_t*(y-cy) + cx - expand_x + canvas_pc
-    # y' = sin_t*(x-cx) + cos_t*(y-cy) + cy - expand_y + canvas_pr
-    tx = -cos_t * cx + sin_t * cy + cx - expand_x + canvas_pc
-    ty = -sin_t * cx - cos_t * cy + cy - expand_y + canvas_pr
-
-    M_stored = np.array([
-        [ cos_t, -sin_t, tx],
-        [ sin_t,  cos_t, ty],
-        [   0.0,    0.0, 1.0],
-    ], dtype=np.float64)
-
-    # Build canvas with cv2.warpAffine (identical transform used for annotations)
     img_np = np.array(he_img, dtype=np.uint8)
-    M_cv   = M_stored[:2, :]  # cv2 takes the 2x3 sub-matrix
+    M_cv   = M_stored[:2, :]
     canvas = cv.warpAffine(
         img_np,
         M_cv,
@@ -388,8 +448,7 @@ def _build_affine_and_canvas(
     )
 
     _log(f"  H&E canvas (cv2): {canvas_w}x{canvas_h}  "
-         f"pr={canvas_pr}, pc={canvas_pc}  "
-         f"rotation={rotation_deg}  tx={tx:.3f}, ty={ty:.3f}")
+         f"pr={canvas_pr}, pc={canvas_pc}  rotation={rotation_deg}")
 
     return canvas, M_stored, canvas_pr, canvas_pc
 
@@ -410,29 +469,13 @@ def _transform_geojson(
     Transform QuPath GeoJSON annotations (native H&E pixel coords) into the
     final upscaled canvas coordinate system.
 
-    Uses the same affine matrix that cv2.warpAffine used to build the H&E
-    canvas, so image and annotations are guaranteed to be consistent.
-
-    Full pipeline (matches working verification script exactly):
+    Full pipeline:
         M_annotations = M_up @ M_stored @ M_scale
 
     where:
-        M_scale   scales native H&E pixels -> reg-resolution pixels
-        M_stored  maps reg-res coords -> canvas coords  (from _build_affine_and_canvas)
-        M_up      scales canvas coords -> upscaled canvas coords
-
-    Parameters
-    ----------
-    geojson_path      : path to QuPath GeoJSON (native H&E pixel coords)
-    he_pixel_um       : native H&E pixel size (um/px)
-    reg_mpp           : registration resolution (um/px)
-    M_stored          : 3x3 affine from _build_affine_and_canvas
-    img_upscaling     : upscaling factor matching the stored H&E image
-    classification_key: column name for QuPath class labels
-
-    Returns
-    -------
-    GeoDataFrame with transformed geometries
+        M_scale  : native H&E pixels -> reg-resolution pixels
+        M_stored : reg-res coords -> canvas coords  (from _build_affine_matrix)
+        M_up     : canvas coords -> upscaled canvas coords
     """
     with open(geojson_path, "r") as f:
         geojson = json.load(f)
@@ -456,7 +499,6 @@ def _transform_geojson(
         [0.0, 0.0, 1.0],
     ], dtype=np.float64)
 
-    # Combined single-pass matrix: native px -> upscaled canvas
     M = M_up @ M_stored @ M_scale
 
     a, b, tx = M[0, 0], M[0, 1], M[0, 2]
@@ -605,6 +647,11 @@ def load_and_align(
     Load a MALDI imzML dataset and an H&E image, auto-register them,
     and return a merged SpatialData object.
 
+    All three coordinate-sensitive steps — registration search, canvas
+    building, and annotation transform — use the same cv2.warpAffine matrix
+    (_build_affine_matrix), so best_idx, canvas pixels, and annotation
+    vertices are all guaranteed to be in the same coordinate system.
+
     Parameters
     ----------
     imzml_path : str
@@ -614,15 +661,11 @@ def load_and_align(
     peaks_path : str or None
         Path to peaks CSV.  Uses bundled PEAKS.csv when None.
     geojson_path : str, Path, or None
-        Optional path to a QuPath GeoJSON annotation export.  Coordinates
-        must be in native H&E pixel space (QuPath default).
-        Annotations are transformed using the same cv2.warpAffine matrix
-        used to build the H&E canvas, guaranteeing consistency.
-        Result stored in sdata.shapes[geojson_shapes_key].
+        Optional path to a QuPath GeoJSON annotation export.
     geojson_shapes_key : str, default "annotations"
         Key under which annotations are stored in sdata.shapes.
     geojson_classification_key : str, default "classification"
-        Column name for the QuPath class label in the resulting GeoDataFrame.
+        Column name for the QuPath class label in the GeoDataFrame.
     maldi_pixel_um : float or None
         Native MALDI pixel size in um.  Auto-read from imzML when None.
     he_pixel_um : float or None
@@ -636,7 +679,7 @@ def load_and_align(
     fine_rotation_step : float
         Degree increment for fine search.
     buffer_px : int
-        Extra canvas padding (px at reg resolution) for the rotation search.
+        Extra canvas padding (px at reg resolution).
     img_upscaling : int
         Each MALDI pixel is upscaled to img_upscaling x img_upscaling canvas
         pixels in the output.
@@ -769,7 +812,6 @@ def load_and_align(
     he_img, loaded_mpp = _load_he_at_resolution(he_path, maldi_pixel_um, he_pixel_um)
     _log(f"  H&E: {he_img.width}x{he_img.height}  ({he_img.width*he_img.height*3/1e6:.0f} MB)")
 
-    # Capture H&E dimensions at reg resolution BEFORE rotation
     he_reg_w = he_img.width
     he_reg_h = he_img.height
 
@@ -780,11 +822,15 @@ def load_and_align(
     he_gray = _he_to_grayscale(he_img)
 
     # ------------------------------------------------------------------
-    # 7. Two-pass rotation + translation search
+    # 7. Two-pass rotation + translation search (cv2-based)
+    #    best_idx is now expressed in the same canvas coordinate system
+    #    as the output canvas built in step 8.
     # ------------------------------------------------------------------
     _log("Running registration ...")
     best_rot, best_idx = _register(
         he_gray, maldi_gray,
+        src_w=he_reg_w,
+        src_h=he_reg_h,
         coarse_step=coarse_rotation_step,
         fine_range=fine_rotation_range,
         fine_step=fine_rotation_step,
@@ -794,9 +840,10 @@ def load_and_align(
     gc.collect()
 
     # ------------------------------------------------------------------
-    # 8. Build H&E output canvas using cv2.warpAffine.
-    #    M_stored is the affine matrix that will also be used for
-    #    annotations -- single source of truth, no PIL involved.
+    # 8. Build H&E output canvas.
+    #    Uses _build_affine_matrix with identical arguments to step 7,
+    #    so the canvas geometry is byte-for-byte the same as the search
+    #    canvas — best_idx is directly valid here.
     # ------------------------------------------------------------------
     _log("Building H&E output canvas ...")
     he_canvas, M_stored, canvas_pr, canvas_pc = _build_affine_and_canvas(
@@ -849,15 +896,10 @@ def load_and_align(
         )
         ann_shapes[geojson_classification_key] = ann_shapes[geojson_classification_key].astype("category")
         sdata.shapes[geojson_shapes_key] = ann_shapes
-
         _log(f"  Annotations added -> sdata.shapes['{geojson_shapes_key}']")
 
     # ------------------------------------------------------------------
     # 11. Store registration transform.
-    #
-    #     affine_matrix: 3x3 float64, maps reg-resolution H&E coords ->
-    #     canvas coords (before upscaling).  annotation.py composes
-    #     M_up @ affine_matrix @ M_scale to get native px -> upscaled canvas.
     # ------------------------------------------------------------------
     sdata["maldi_adata"].uns["he_transform"] = {
         "rotation_deg":     float(best_rot),
