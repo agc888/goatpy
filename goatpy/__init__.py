@@ -9,7 +9,9 @@ from .graphpca_mod import graphpca_spatialdata, kneighbors_graph_spatial, get_km
 from .auto_align import load_and_align
 from .preprocessing import normalize_spatialdata
 from .he_image import he_spatialdata, add_annotations
-from .annotation import add_qupath_annotations
+from .annotation import annotate_per_pixel
+from .filter import filter_spatialdata
+from .tools import annotate_glycans
 
 
 __all__ = [
@@ -23,8 +25,10 @@ __all__ = [
     "launch_landmark_gui",
     "load_and_align",
     "normalize_spatialdata",
-    "add_qupath_annotations",
-    "add_annotations"
+    "add_annotations",
+    "filter_spatialdata",
+    "annotate_per_pixel",
+    "annotate_glycans"
 ]
 
 __version__ = "0.1.0"
