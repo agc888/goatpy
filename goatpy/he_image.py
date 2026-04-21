@@ -15,7 +15,7 @@ from PIL import Image
 from PIL.ExifTags import TAGS
 
 
-def he_spatialdata(he_image_path, backend = 'tiffslide'):
+def he_spatialdata(he_image_path, backend = 'openslide'):
 
     try:
         sdata = sopa.io.wsi(he_image_path,  backend=backend)
@@ -27,7 +27,7 @@ def he_spatialdata(he_image_path, backend = 'tiffslide'):
         return sdata
     
     except Exception as e:
-        warnings.warn(f"sopa.io.wsi failed ({type(e).__name__}: {e}). Falling back to PIL method.")
+        warnings.warn(f"sopa.io.wsi failed! Try running `pip install {backend}`. Falling back to PIL method. ")
     
     # Fallback method
     he_img = Image.open(he_image_path)

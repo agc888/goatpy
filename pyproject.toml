@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools<81"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,6 +28,7 @@ dependencies = [
   "numpy>=2.2",
   "pandas>=2.3",
   "anndata>=0.11",
+  "setuptools<81",
   "spatialdata>=0.4",
   "spatialdata-io>=0.3",
   "tifffile>=2025.5",
@@ -44,12 +45,18 @@ dependencies = [
   "matplotlib>=3.7",
   "psutil>=5.9",
   "sopa>=2.0",
+  "napari",
+  "openslide-python",
+  "openslide-bin",
+  "pyqt5",
+  "napari-spatialdata",
   "metaspace-converter>=1.1",
 ]
 
 [project.optional-dependencies]
 napari = [
   "napari>=0.4.19",
+  "tiffslide",
   "napari-spatialdata>=0.5",
   "pyqt5>=5.15",
   "qtpy>=2.0",

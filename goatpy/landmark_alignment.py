@@ -1,11 +1,11 @@
 import spatialdata
-from spatialdata import SpatialData
 import napari
-from napari.utils.notifications import show_info
 import numpy as np
+import pandas as pd
+
 from spatialdata import SpatialData
 from spatialdata.models import PointsModel
-import pandas as pd
+from napari.utils.notifications import show_info
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QListWidget, QMessageBox, QComboBox, QGroupBox
@@ -571,7 +571,7 @@ def launch_landmark_gui(
     he_image_key: str = "he_image",
     split_view: bool = False,
     maldi_scale_level: str = None,
-    he_scale_level: str = "sc",
+    he_scale_level: str = "scale0",
 ):
     """
     Launch the landmark alignment GUI.
