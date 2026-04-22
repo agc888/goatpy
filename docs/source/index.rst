@@ -9,7 +9,7 @@ mass spectrometry imaging with H&E histology registration and analysis.
    :caption: Getting started
 
    installation
-   quickstart
+   guides/getting_started
 
 .. toctree::
    :maxdepth: 2

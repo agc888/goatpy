@@ -16,6 +16,7 @@ extensions = [
     'sphinx.ext.intersphinx',
     'myst_parser',
     'autoapi.extension',
+    'nbsphinx'
 ]
 
 autoapi_dirs = ['../../goatpy']
@@ -70,3 +71,5 @@ source_suffix = {
     '.rst': 'restructuredtext',
     '.md': 'markdown',
 }
+
+nbsphinx_execute = 'never'
