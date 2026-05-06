@@ -156,10 +156,11 @@ def _load_spectra(imzml_path: str,
                   peaks: list[float],
                   chunk_size: int = 10,
                   crop_r: int = 0,
-                  crop_c: int = 0) -> np.ndarray:
+                  crop_c: int = 0,
+                  tol: float = 0.1) -> np.ndarray:
     from pyimzml.ImzMLParser import getionimage
     p0    = ImzMLParser(imzml_path)
-    probe = getionimage(p0, peaks[0], tol=0.1, reduce_func=max)
+    probe = getionimage(p0, peaks[0], tol=tol, reduce_func=max)
     h     = probe.shape[0] - crop_r
     w     = probe.shape[1] - crop_c
     del probe
@@ -642,6 +643,7 @@ def load_and_align(
     fine_rotation_step: float = 1.0,
     buffer_px: int = 150,
     img_upscaling: int = 10,
+    tol: float = 0.1
 ) -> SpatialData:
     """
     Load a MALDI imzML dataset and an H&E image, auto-register them,
@@ -683,6 +685,8 @@ def load_and_align(
     img_upscaling : int
         Each MALDI pixel is upscaled to img_upscaling x img_upscaling canvas
         pixels in the output.
+    tol : int
+        Tolerance value for each m/z value in ppm. Size of individual m/z peak bin. 
 
     Returns
     -------
@@ -793,6 +797,7 @@ def load_and_align(
         imzml_path, peaks,
         chunk_size=spectra_chunk_size,
         crop_r=crop_r, crop_c=crop_c,
+        tol = tol,
     )
     _log(f"  spectra_all: {spectra_all.shape}  ({spectra_all.nbytes/1e6:.0f} MB)")
 

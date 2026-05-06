@@ -1,4 +1,5 @@
 import numpy as np
+import csv
 from pyimzml.ImzMLParser import ImzMLParser, getionimage
 from joblib import Parallel, delayed
 from functools import partial
@@ -48,13 +49,50 @@ def getimage(peak, path, tol = 0.1):
     
 
 def rd_peaks(fn):
-    data = []
-    with open(fn) as f:
-        f.readline() #header
-        for line in f:
-            ss = line.split()
-            if ss[0].strip('"') == 'M': continue
-            data.append(float(ss[1]))
+
+    with open(fn, newline='', encoding='utf-8-sig') as f:
+        # Detect delimiter by sniffing the first line
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=',\t ')
+        except csv.Error:
+            dialect = csv.excel  # fallback to comma
+
+        reader = csv.reader(f, dialect)
+        header = next(reader)
+
+        # 1. Try to find a column whose name contains 'm/z' (case-insensitive)
+        mz_col = next(
+            (i for i, h in enumerate(header) if 'm/z' in h.lower()),
+            None
+        )
+
+        if mz_col is not None:
+            col_idx = mz_col
+        elif len(header) == 1:
+            warnings.warn(
+                "No 'm/z' column found. Attempting to infer column with numeric values."
+            )
+            # Single-column file — read col 0 but skip the header we already consumed
+            col_idx = 0
+        else:
+            warnings.warn(
+                "No 'm/z' column found. Attempting to infer column with numeric values."
+            )
+            # Multi-column, no m/z header found — fall back to column index 1
+            col_idx = 1
+
+        data = []
+        for row in reader:
+            if col_idx >= len(row):
+                continue
+            val = row[col_idx].strip().strip('"')
+            try:
+                data.append(float(val))
+            except ValueError:
+                continue  # skip non-numeric rows
+
     return data
 
 
