@@ -168,7 +168,7 @@ def _load_spectra(imzml_path: str,
     out = np.zeros((h, w, len(peaks)), dtype=np.float32)
     for start in range(0, len(peaks), chunk_size):
         batch = peaks[start: start + chunk_size]
-        imgs  = parmap(partial(getimage, path=imzml_path), batch,
+        imgs  = parmap(partial(getimage, path=imzml_path, tol=tol), batch,
                        nprocs=min(len(batch), 4))
         for j, img in enumerate(imgs):
             out[:, :, start + j] = img[crop_r:, crop_c:]
@@ -685,7 +685,7 @@ def load_and_align(
     img_upscaling : int
         Each MALDI pixel is upscaled to img_upscaling x img_upscaling canvas
         pixels in the output.
-    tol : int
+    tol : float
         Tolerance value for each m/z value in ppm. Size of individual m/z peak bin. 
 
     Returns
@@ -781,7 +781,7 @@ def load_and_align(
     # ------------------------------------------------------------------
     _log("Computing MALDI crop offsets ...")
     tic_probe = np.nansum(
-        np.stack([getimage(pk, path=imzml_path) for pk in peaks[:5]], axis=-1),
+        np.stack([getimage(pk, path=imzml_path, tol = tol) for pk in peaks[:5]], axis=-1),
         axis=-1,
     )
     crop_r, crop_c = _crop_offsets(tic_probe)
