@@ -157,10 +157,11 @@ def _load_spectra(imzml_path: str,
                   chunk_size: int = 10,
                   crop_r: int = 0,
                   crop_c: int = 0,
-                  tol: float = 0.1) -> np.ndarray:
+                  tol: float = 0.1,
+                  reduce_func: Any = sum) -> np.ndarray:
     from pyimzml.ImzMLParser import getionimage
     p0    = ImzMLParser(imzml_path)
-    probe = getionimage(p0, peaks[0], tol=tol, reduce_func=max)
+    probe = getionimage(p0, peaks[0], tol=tol, reduce_func=reduce_func)
     h     = probe.shape[0] - crop_r
     w     = probe.shape[1] - crop_c
     del probe
@@ -168,7 +169,7 @@ def _load_spectra(imzml_path: str,
     out = np.zeros((h, w, len(peaks)), dtype=np.float32)
     for start in range(0, len(peaks), chunk_size):
         batch = peaks[start: start + chunk_size]
-        imgs  = parmap(partial(getimage, path=imzml_path, tol=tol), batch,
+        imgs  = parmap(partial(getimage, path=imzml_path, tol=tol, reduce_func = reduce_func), batch,
                        nprocs=min(len(batch), 4))
         for j, img in enumerate(imgs):
             out[:, :, start + j] = img[crop_r:, crop_c:]
@@ -564,7 +565,7 @@ def _build_spatialdata(spectra_all: np.ndarray,
     he_c = ((local_off_c + (grid_c.flatten() + 0.5) * scale) * us)
 
     adata = ad.AnnData(spectra_all.reshape(-1, n_peaks).copy(), dtype=np.float32)
-    adata.var_names = np.array(["%.1f" % pk for pk in peaks])
+    adata.var_names = np.array([str(pk) for pk in peaks])
     adata.obs_names = np.array([str(i) for i in range(maldi_h * maldi_w)])
 
     yy, xx = np.mgrid[crop_r: maldi_h + crop_r, crop_c: maldi_w + crop_c]
@@ -643,7 +644,8 @@ def load_and_align(
     fine_rotation_step: float = 1.0,
     buffer_px: int = 150,
     img_upscaling: int = 10,
-    tol: float = 0.1
+    tol: float = 0.1,
+    reduce_func: Any = sum,
 ) -> SpatialData:
     """
     Load a MALDI imzML dataset and an H&E image, auto-register them,
@@ -687,6 +689,8 @@ def load_and_align(
         pixels in the output.
     tol : float
         Tolerance value for each m/z value in ppm. Size of individual m/z peak bin. 
+    reduce_func : str
+        Method of peak binning when the tolerance value provided spans across multiple peaks. Options can be sum or max.
 
     Returns
     -------
@@ -703,6 +707,7 @@ def load_and_align(
     # ------------------------------------------------------------------
     _log("Loading peaks ...")
     peaks = rd_peaks(peaks_path) if peaks_path else rd_peaks_from_package()
+    peaks = sorted(peaks)
     _log(f"  {len(peaks)} peaks")
 
     # ------------------------------------------------------------------
@@ -781,7 +786,7 @@ def load_and_align(
     # ------------------------------------------------------------------
     _log("Computing MALDI crop offsets ...")
     tic_probe = np.nansum(
-        np.stack([getimage(pk, path=imzml_path, tol = tol) for pk in peaks[:5]], axis=-1),
+        np.stack([getimage(pk, path=imzml_path, tol = tol, reduce_func = reduce_func) for pk in peaks[:5]], axis=-1),
         axis=-1,
     )
     crop_r, crop_c = _crop_offsets(tic_probe)
@@ -792,12 +797,14 @@ def load_and_align(
     # ------------------------------------------------------------------
     # 3. Load spectra in chunks
     # ------------------------------------------------------------------
-    _log(f"Loading {len(peaks)} ion images (chunk={spectra_chunk_size}) ...")
+    _log(f"Loading {len(peaks)} ion images (chunk={spectra_chunk_size}) with {tol} Da tolerance per peak ...")
+    
     spectra_all = _load_spectra(
         imzml_path, peaks,
         chunk_size=spectra_chunk_size,
         crop_r=crop_r, crop_c=crop_c,
         tol = tol,
+        reduce_func = reduce_func,
     )
     _log(f"  spectra_all: {spectra_all.shape}  ({spectra_all.nbytes/1e6:.0f} MB)")
 

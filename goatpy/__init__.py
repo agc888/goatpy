@@ -11,7 +11,9 @@ from .preprocessing import normalize_spatialdata
 from .he_image import he_spatialdata, add_annotations
 from .annotation import annotate_per_pixel
 from .filter import filter_spatialdata
-from .tools import annotate_glycans
+from .tools import annotate_glycans, merge_spatialdata
+from .bin import bin_and_align, bin_imzml
+from .plotting import check_batch, plot_spectrum, plot_spectra_comparison
 
 
 __all__ = [
@@ -28,7 +30,15 @@ __all__ = [
     "add_annotations",
     "filter_spatialdata",
     "annotate_per_pixel",
-    "annotate_glycans"
+    "annotate_glycans",
+    "merge_spatialdata",
+    "bin_and_align",
+    "bin_imzml",
+    "check_batch",
+    "plot_spectrum",
+    "plot_spectra_comparison"
+
+
 ]
 
 __version__ = "0.1.0"

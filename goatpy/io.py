@@ -43,9 +43,9 @@ def parmap(f, X, nprocs=None):
     )
 
 
-def getimage(peak, path, tol = 0.1): 
+def getimage(peak, path, tol = 0.1,reduce_func = sum): 
     p =  ImzMLParser(path) #individual file pointers otherwise parsing is corrupted
-    return getionimage(p, peak, tol=tol, reduce_func=max)
+    return getionimage(p, peak, tol=tol, reduce_func=reduce_func)
     
 
 def rd_peaks(fn):
@@ -115,7 +115,7 @@ def rd_peaks_from_package():
     return data
 
 
-def glyco_spatialdata(imzml_path, peaks_path = None, tol = 0.1, pixel_size = 20):
+def glyco_spatialdata(imzml_path, peaks_path = None, tol = 0.1, pixel_size = 20, reduce_func = sum):
 
     # Load Peaks
     if peaks_path is None:
@@ -123,8 +123,10 @@ def glyco_spatialdata(imzml_path, peaks_path = None, tol = 0.1, pixel_size = 20)
     else:
         peaks = rd_peaks(peaks_path)
 
+    peaks = sorted(peaks)
+
     # Load ImzML data
-    getimg = partial(getimage, path=imzml_path, tol = tol)
+    getimg = partial(getimage, path=imzml_path, tol = tol, reduce_func = reduce_func)
 
     spectra_all = np.stack(
         parmap(getimg, peaks, 10),
@@ -140,7 +142,7 @@ def glyco_spatialdata(imzml_path, peaks_path = None, tol = 0.1, pixel_size = 20)
     # Create AnnData Object
     spectra_flat = np.array([spectra_all[y-1, x-1, :] for x, y in coords])
     anndata = ad.AnnData(spectra_flat, dtype=np.float32)
-    anndata.var_names = np.array(["%.1f" % p for p in peaks])
+    anndata.var_names = np.array([str(pk) for pk in peaks])
     anndata.obs_names = np.array(list(map(str, range(len(coords)))))
     anndata.obs["full_x"] = coords[:, 0]
     anndata.obs["full_y"] = coords[:, 1]
