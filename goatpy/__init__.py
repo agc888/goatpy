@@ -14,7 +14,7 @@ from .filter import filter_spatialdata
 from .tools import annotate_glycans, merge_spatialdata
 from .bin import bin_and_align, bin_imzml
 from .plotting import check_batch, plot_spectrum, plot_spectra_comparison
-
+from .batch_correction import batch_correction
 
 __all__ = [
     "Add_Pseudo_Image",
@@ -36,7 +36,8 @@ __all__ = [
     "bin_imzml",
     "check_batch",
     "plot_spectrum",
-    "plot_spectra_comparison"
+    "plot_spectra_comparison",
+    "batch_correction",
 
 
 ]
