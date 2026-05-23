@@ -88,7 +88,8 @@ def _run_harmony(
     pcs: int,
     batch_col: str,
     random_state: int,
-    scale_per_batch: bool = True,
+    feature_join: str = "inner",
+    offset_coords: bool = True,
 ) -> SpatialData:
     """
     Run Harmony on a PCA embedding and store the result in
@@ -271,7 +272,6 @@ def batch_correction(
     batch_names: list[str],
     method: Literal["harmony", "combat"] = "harmony",
     pcs: int = 30,
-    scale_per_batch: bool = True,
     covariates: Optional[list[str]] = None,
     table_name: str = "maldi_adata",
     batch_col: str = "batch",
@@ -429,8 +429,9 @@ def batch_correction(
             table_name=table_name,
             pcs=pcs,
             batch_col=batch_col,
-            random_state=random_state,
-            scale_per_batch=scale_per_batch,
+            random_state=random_state, 
+            feature_join=feature_join,
+            offset_coords=offset_coords,
         )
     else:  # combat
         merged = _run_combat(
@@ -444,7 +445,6 @@ def batch_correction(
     merged.tables[table_name].uns["batch_correction"] = {
         "method":          method,
         "pcs":             pcs if method == "harmony" else None,
-        "scale_per_batch": scale_per_batch if method == "harmony" else None,
         "covariates":      covariates if method == "combat" else None,
         "batch_names":     batch_names,
         "n_batches":       len(batch_names),
