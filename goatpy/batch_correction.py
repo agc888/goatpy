@@ -57,6 +57,7 @@ import warnings
 from typing import Literal, Optional
 
 import numpy as np
+import pandas as pd
 
 from spatialdata import SpatialData
 
@@ -95,16 +96,11 @@ def _run_harmony(
     Run Harmony on a PCA embedding and store the result in
     ``adata.obsm["X_pca_harmony"]``.
 
-    If ``scale_per_batch=True`` (default), each batch's intensity matrix is
-    z-scored independently (mean=0, std=1 per feature) before PCA.  This
-    removes absolute scale differences between batches — e.g. a 5x intensity
-    offset from different instruments — so PCA captures biological variance
-    rather than technical scale.  The scaling is applied to a temporary copy
-    used only for PCA; ``adata.X`` is not modified.
-
-    If ``adata.obsm["GraphPCA"]`` already exists, ``scale_per_batch`` is
-    ignored and the existing embedding is used directly.  If you want fresh
-    per-batch-scaled PCA, delete ``adata.obsm["GraphPCA"]`` before calling.
+    Works directly on the already-merged table so that all spatial
+    coordinates (he_x, he_y, obsm["spatial"]) and obs_names set by
+    merge_spatialdata are preserved.  Each batch's intensities are
+    z-scored independently before PCA so absolute scale differences
+    between instruments are removed; adata.X is never modified.
     """
     try:
         import harmonypy
@@ -113,79 +109,72 @@ def _run_harmony(
             "harmonypy is required for Harmony batch correction.\n"
             "Install it with:  pip install harmonypy"
         ) from e
-    
-    import scanpy as sc
+
     import anndata as ad
+    import scanpy as sc
     from scipy.sparse import issparse
     from sklearn.preprocessing import StandardScaler
 
-    def get_dense(adata):
-        return adata.X.toarray() if issparse(adata.X) else np.array(adata.X)
-
-    scaled_adatas = []
-
-    for sdata, batch_name in zip(sdatas, batch_names):
-
-        _log(f"  Processing batch: {batch_name}")
-
-        adata = sdata.tables[table_name].copy()
-
-        adata.obs[batch_col] = batch_name
-
-        X = get_dense(adata).astype(np.float64)
-
-        scaler = StandardScaler()
-
-        X_scaled = scaler.fit_transform(X)
-
-        adata.X = X_scaled
-        
-        scaled_adatas.append(adata)
-    
-    
-    adata = ad.concat(scaled_adatas)
+    # Work on the merged table — obs_names and spatial coords are already
+    # correct from merge_spatialdata; don't replace this table.
+    merged_adata = merged.tables[table_name]
 
     _log(
         f"  Merged object: "
-        f"{adata.n_obs:,} pixels × {adata.n_vars:,} features"
+        f"{merged_adata.n_obs:,} pixels × {merged_adata.n_vars:,} features"
+    )
+
+    # Z-score each batch independently on a temporary matrix so that
+    # absolute intensity scale differences between instruments are removed.
+    # merged_adata.X is never modified.
+    X_raw = (
+        merged_adata.X.toarray()
+        if issparse(merged_adata.X)
+        else np.array(merged_adata.X, dtype=np.float64)
+    )
+    X_scaled = np.empty_like(X_raw, dtype=np.float64)
+
+    for batch_name in batch_names:
+        mask = merged_adata.obs[batch_col].astype(str) == str(batch_name)
+        idx = np.where(mask)[0]
+        if idx.size == 0:
+            _log(f"  WARNING: no pixels found for batch '{batch_name}'")
+            continue
+        scaler = StandardScaler()
+        X_scaled[idx] = scaler.fit_transform(X_raw[idx])
+        _log(f"  Scaled batch '{batch_name}': {idx.size:,} pixels")
+
+    # Lightweight AnnData just for PCA — obs is shared so Harmony gets
+    # the correct batch labels without touching any spatial metadata.
+    pca_adata = ad.AnnData(
+        X=X_scaled.astype(np.float32),
+        obs=merged_adata.obs.copy(),
     )
 
     _log(f"  Running PCA ({pcs} PCs)...")
-
-    sc.pp.pca(
-        adata,
-        n_comps=pcs,
-        random_state=random_state,
-    )
+    sc.pp.pca(pca_adata, n_comps=pcs, random_state=random_state)
 
     _log("  Running Harmony...")
-
-    x = adata.obsm["X_pca"].astype(np.float64)
+    x = pca_adata.obsm["X_pca"].astype(np.float64)
 
     harmony_out = harmonypy.run_harmony(
         x,
-        adata.obs,
+        pca_adata.obs,
         batch_col,
         max_iter_harmony=20,
     )
 
-    if harmony_out.Z_corr.shape[0] == adata.n_obs:
-        corrected = harmony_out.Z_corr
-    else:
-        corrected = harmony_out.Z_corr.T
+    corrected = harmony_out.Z_corr
+    if corrected.shape[0] != merged_adata.n_obs:
+        corrected = corrected.T
 
-    adata.obsm["X_pca_harmony"] = corrected.astype(np.float32)
+    # Attach embeddings to the merged table — everything else stays intact.
+    merged_adata.obsm["X_pca_harmony"] = corrected.astype(np.float32)
+    merged_adata.obsm["X_pca"] = pca_adata.obsm["X_pca"]
 
-    _log(
-        f"  Harmony complete. "
-        f"Corrected embedding shape={corrected.shape}"
-    )
-
-    merged[table_name] = adata
+    _log(f"  Harmony complete. Corrected embedding shape={corrected.shape}")
 
     return merged
-
-
 
 # ---------------------------------------------------------------------------
 # Internal: ComBat correction

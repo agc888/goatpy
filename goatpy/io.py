@@ -1,20 +1,22 @@
 import numpy as np
-import csv
-from pyimzml.ImzMLParser import ImzMLParser, getionimage
-from joblib import Parallel, delayed
-from functools import partial
 import anndata as ad
 import pandas as pd
 import geopandas as gpd
+import tifffile as tiff
+import csv
+import pkg_resources
+import os
+import warnings
+
+from pyimzml.ImzMLParser import ImzMLParser, getionimage
+from joblib import Parallel, delayed
+from functools import partial
+
 from shapely.geometry import box
-import numpy as np
 from anndata import AnnData
 from spatialdata import SpatialData
 from spatialdata.models import PointsModel, Image2DModel, TableModel, ShapesModel
 from spatialdata.transformations import Identity
-import pkg_resources
-import os
-
 
 
 def parmap(f, X, nprocs=None):
@@ -242,3 +244,86 @@ def centroids_to_pixel_squares(df, x_col="x", y_col="y", pixel_size=1.0):
     
     return gdf
 
+
+
+def ihc_spatialdata(
+    ihc_image_path,
+    channel_names=None,
+    image_key="ihc_image"
+):
+    """
+    Generate a SpatialData object from a multichannel IHC TIFF/OME-TIFF image.
+
+    Parameters
+    ----------
+    ihc_image_path : str
+        Path to TIFF/OME-TIFF image.
+
+    channel_names : list, optional
+        Names of image channels.
+        Example:
+        ["sc_405", "CF_488", "CF_561", "DIC"]
+
+    image_key : str
+        Name of image key in SpatialData object.
+
+    Returns
+    -------
+    SpatialData
+    """
+
+    try:
+        # Read TIFF / OME-TIFF
+        img = tiff.imread(ihc_image_path)
+
+        print(f"Loaded image with shape: {img.shape}")
+
+        # RGB image (Y, X, 3)
+        if img.ndim == 3 and img.shape[-1] in [3, 4]:
+
+            # Convert to channel-first (C, Y, X)
+            image_cyx = np.transpose(img, (2, 0, 1))
+
+            if channel_names is None:
+                channel_names = [f"channel_{i}" for i in range(image_cyx.shape[0])]
+
+        # Multichannel image already channel-first (C, Y, X)
+        elif img.ndim == 3:
+
+            image_cyx = img
+
+            if channel_names is None:
+                channel_names = [f"channel_{i}" for i in range(image_cyx.shape[0])]
+
+        # Single-channel image
+        elif img.ndim == 2:
+
+            image_cyx = img[np.newaxis, :, :]
+
+            if channel_names is None:
+                channel_names = ["channel_0"]
+
+        else:
+            raise ValueError(
+                f"Unsupported image dimensions: {img.shape}"
+            )
+
+        img_model = Image2DModel.parse(
+            image_cyx,
+            dims=("c", "y", "x"),
+            c_coords=channel_names,
+            transformations={"global": Identity()},
+        )
+
+        sdata = SpatialData(
+            images={image_key: img_model}
+        )
+
+        print("Successfully generated SpatialData object")
+
+        return sdata
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to generate SpatialData object: {str(e)}"
+        )

@@ -234,7 +234,6 @@ def annotate_glycans(
     return sdata
 
 
-
 def merge_spatialdata(
     sdatas: list,
     batch_names: list[str],
@@ -246,47 +245,35 @@ def merge_spatialdata(
     Merge a list of SpatialData objects into a single SpatialData object,
     suffixing each element key with its batch name to avoid collisions.
 
+    SpatialData elements (images, shapes, points) are never modified.
+    When offset_coords=True, only adata.obsm["spatial"] and adata.uns["spatial"]
+    are shifted so batches appear side-by-side in scanpy/squidpy plots.
+
     Parameters
     ----------
     sdatas : list of SpatialData
     batch_names : list of str
-        Must match length of sdatas. Used as suffix for all element keys
+        One label per SpatialData. Used as suffix for all element keys
         and added to adata.obs["batch"].
     table_name : str
         Key of the AnnData table in each SpatialData object.
     offset_coords : bool
-        If True, offset he_x / he_y / spatial coords so batches sit
-        side-by-side rather than overlapping in the merged canvas.
+        If True, shift obsm["spatial"] and uns["spatial"] image coords
+        so batches appear side-by-side in scanpy/squidpy plots.
+        SpatialData elements are never modified regardless.
     feature_join : "inner" | "outer"
-        How to handle m/z features not present in all samples.
-
-        * ``"inner"`` (default) — keep only features common to ALL samples.
-          Any m/z not found in every batch is dropped. The resulting matrix
-          has no missing values.
-        * ``"outer"`` — keep ALL features across all samples. Pixels from a
-          batch that lacks a feature are filled with 0. Useful when samples
-          were acquired with slightly different peak lists.
+        "inner" keeps only features common to ALL samples.
+        "outer" keeps all features, filling missing pixels with 0.
 
     Returns
     -------
     SpatialData
-
-    Examples
-    --------
-    >>> # Only common m/z features (default)
-    >>> merged = merge_spatialdata([sdata1, sdata2], ["batch1", "batch2"])
-
-    >>> # Keep all features, fill missing with 0
-    >>> merged = merge_spatialdata(
-    ...     [sdata1, sdata2], ["batch1", "batch2"], feature_join="outer"
-    ... )
     """
     import numpy as np
     import anndata as ad
     import geopandas as gpd
     import pandas as pd
     import re
-    from shapely.affinity import translate
     from spatialdata import SpatialData
     from spatialdata.models import Image2DModel, PointsModel, ShapesModel, TableModel
     from spatialdata.transformations import Identity
@@ -296,25 +283,16 @@ def merge_spatialdata(
             f"sdatas ({len(sdatas)}) and batch_names ({len(batch_names)}) "
             f"must have the same length."
         )
-
     if feature_join not in ("inner", "outer"):
         raise ValueError(
             f"feature_join must be 'inner' or 'outer', got '{feature_join}'."
         )
-
-    # Validate batch names
     for b in batch_names:
         if not re.match(r'^[A-Za-z0-9_.\-]+$', b):
             raise ValueError(
                 f"batch_name '{b}' contains invalid characters. "
                 f"Use only alphanumeric characters, underscores, dots or hyphens."
             )
-
-    all_images = {}
-    all_points = {}
-    all_shapes = {}
-    all_adatas = []
-    x_offset   = 0.0
 
     def _make_key(base: str, batch: str) -> str:
         safe_base = re.sub(r'[^A-Za-z0-9_.\-]', '_', base)
@@ -323,44 +301,51 @@ def merge_spatialdata(
     def _strip_transforms(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         gdf = gdf.copy()
         gdf.attrs = {}
-        drop_cols = [c for c in gdf.columns if c.startswith("transform")]
-        return gdf.drop(columns=drop_cols, errors="ignore")
+        return gdf.drop(
+            columns=[c for c in gdf.columns if c.startswith("transform")],
+            errors="ignore",
+        )
 
-    # ----------------------------------------------------------------
-    # Report feature overlap before merging
-    # ----------------------------------------------------------------
-    all_var_sets = [set(sd.tables[table_name].var_names) for sd in sdatas]
-    common_features = set.intersection(*all_var_sets)
-    all_features    = set.union(*all_var_sets)
-    unique_per_batch = {
-        b: all_var_sets[i] - common_features
-        for i, b in enumerate(batch_names)
-    }
+    # ------------------------------------------------------------------
+    # Report feature overlap
+    # ------------------------------------------------------------------
+    all_var_sets     = [set(sd.tables[table_name].var_names) for sd in sdatas]
+    common_features  = set.intersection(*all_var_sets)
+    all_features     = set.union(*all_var_sets)
 
     print("Feature summary:")
     print(f"  Common to all batches   : {len(common_features):,}")
     print(f"  Total across all batches: {len(all_features):,}")
-    for b, uniq in unique_per_batch.items():
+    for i, b in enumerate(batch_names):
+        uniq = all_var_sets[i] - common_features
         print(f"  Unique to {b:20s}: {len(uniq):,}")
     print(
         f"  feature_join='{feature_join}' → keeping "
         f"{'common features only' if feature_join == 'inner' else 'all features (filling missing with 0)'}"
     )
 
-    # ----------------------------------------------------------------
-    # Main loop — images, shapes, points, AnnData per batch
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Main loop — build spatialdata elements and adatas
+    # ------------------------------------------------------------------
+    all_images = {}
+    all_points = {}
+    all_shapes = {}
+    all_adatas = []
+    x_offset   = 0.0
+
     for sdata, batch in zip(sdatas, batch_names):
 
         adata = sdata.tables[table_name].copy()
         n_obs = adata.n_obs
 
-        if offset_coords and "he_x" in adata.obs.columns:
+        # Compute this batch's x-width for offset calculation
+        # Uses he_x which is in the native spatialdata coordinate system
+        if "he_x" in adata.obs.columns:
             batch_width = float(adata.obs["he_x"].max()) + 100.0
         else:
-            batch_width = 0.0
+            batch_width = float(adata.obsm["spatial"][:, 0].max()) + 100.0
 
-        # Images
+        # ---- Images: stored as-is, keyed by batch, no coord changes ----
         for key, img in sdata.images.items():
             new_key = _make_key(key, batch)
             try:
@@ -377,61 +362,67 @@ def merge_spatialdata(
                 transformations={"global": Identity()},
             )
 
-        # Shapes
+        # ---- Shapes: native coords, no geometry changes ----
         for key, gdf in sdata.shapes.items():
             new_key  = _make_key(key, batch)
             gdf_copy = _strip_transforms(gdf)
-            if offset_coords and x_offset != 0.0:
-                gdf_copy["geometry"] = gdf_copy["geometry"].apply(
-                    lambda geom: translate(geom, xoff=x_offset, yoff=0.0)
-                )
             all_shapes[new_key] = ShapesModel.parse(
                 gdf_copy,
                 transformations={"global": Identity()},
             )
 
-        # Points
+        # ---- Points: native coords, no changes ----
         for key, pts in sdata.points.items():
             new_key = _make_key(key, batch)
             pts_df  = pts.compute() if hasattr(pts, "compute") else pts.copy()
-            pts_df  = pts_df.reset_index(drop=True)
-            pts_df  = pts_df.drop(
+            pts_df  = pts_df.reset_index(drop=True).drop(
                 columns=[c for c in pts_df.columns if c.startswith("transform")],
                 errors="ignore",
             )
-            if offset_coords and x_offset != 0.0 and "x" in pts_df.columns:
-                pts_df["x"] = pts_df["x"] + x_offset
             all_points[new_key] = PointsModel.parse(
                 pts_df,
                 transformations={"global": Identity()},
             )
 
-        # AnnData
-        pixel_region_key    = _make_key("pixels", batch)
+        # ---- AnnData ----
+        adata.obs_names     = [f"{batch}_{i}" for i in range(n_obs)]
         adata.obs["batch"]  = batch
         adata.obs["batch"]  = adata.obs["batch"].astype("category")
+        pixel_region_key    = _make_key("pixels", batch)
         adata.obs["region"] = pixel_region_key
         adata.obs["region"] = adata.obs["region"].astype("category")
-        adata.obs_names     = [f"{batch}_{i}" for i in range(n_obs)]
         adata.uns.pop("spatialdata_attrs", None)
 
+        # Modify obsm["spatial"] and uns["spatial"] image coords for
+        # scanpy/squidpy offset plots. Nothing else is touched.
         if offset_coords and x_offset != 0.0:
-            if "he_x" in adata.obs.columns:
-                adata.obs["he_x"] = adata.obs["he_x"] + x_offset
+
+            # Shift obsm["spatial"] x-axis only
             if "spatial" in adata.obsm:
                 adata.obsm["spatial"] = adata.obsm["spatial"].copy()
                 adata.obsm["spatial"][:, 0] += x_offset
 
+            # Shift uns["spatial"] image registration coords so the
+            # thumbnail appears in the right place in sc.pl.spatial
+            if "spatial" in adata.uns:
+                for lib_id, lib in adata.uns["spatial"].items():
+                    sf = lib.get("scalefactors", {}).get("tissue_hires_scalef", 1.0)
+                    # sc.pl.spatial uses obsm["spatial"] directly so the
+                    # image offset just needs to match — we don't move the
+                    # image array itself, only record the shift in uns so
+                    # any downstream code that reads it stays consistent
+                    lib["x_offset"] = float(x_offset)
+
         all_adatas.append(adata)
         x_offset += batch_width
 
-    # ----------------------------------------------------------------
-    # Concatenate AnnData with chosen join strategy
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Concatenate AnnData
+    # ------------------------------------------------------------------
     merged_adata = ad.concat(
         all_adatas,
-        join=feature_join,  # "inner" drops unique features; "outer" fills with 0
-        fill_value=0.0,     # only applied when join="outer"
+        join=feature_join,
+        fill_value=0.0,
     )
     merged_adata.obs["instance_id"] = np.arange(len(merged_adata)).astype(str)
 
@@ -441,9 +432,9 @@ def merge_spatialdata(
         categories=all_pixel_regions,
     )
 
-    # ----------------------------------------------------------------
-    # Build fresh SpatialData
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Build SpatialData
+    # ------------------------------------------------------------------
     merged = SpatialData(
         images=all_images,
         points=all_points,
@@ -467,5 +458,3 @@ def merge_spatialdata(
     print(f"  Points : {list(all_points.keys())}")
 
     return merged
-
-

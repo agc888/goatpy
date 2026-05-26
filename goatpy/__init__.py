@@ -2,7 +2,7 @@
 goatpy — spatial data utilities for MALDI & pseudo-image generation.
 """
 
-from .io import glyco_spatialdata
+from .io import glyco_spatialdata, ihc_spatialdata
 from .pseudo_image import Add_Pseudo_Image
 from .landmark_alignment import align_image_using_landmarks, launch_landmark_gui
 from .graphpca_mod import graphpca_spatialdata, kneighbors_graph_spatial, get_kmean_clusters
@@ -38,6 +38,7 @@ __all__ = [
     "plot_spectrum",
     "plot_spectra_comparison",
     "batch_correction",
+    "ihc_spatialdata"
 
 
 ]
