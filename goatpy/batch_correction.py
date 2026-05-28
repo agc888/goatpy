@@ -90,7 +90,6 @@ def _run_harmony(
     batch_col: str,
     random_state: int,
     feature_join: str = "inner",
-    offset_coords: bool = True,
 ) -> SpatialData:
     """
     Run Harmony on a PCA embedding and store the result in
@@ -265,7 +264,6 @@ def batch_correction(
     table_name: str = "maldi_adata",
     batch_col: str = "batch",
     feature_join: str = "inner",
-    offset_coords: bool = True,
     random_state: int = 42,
 ) -> SpatialData:
     """
@@ -295,14 +293,6 @@ def batch_correction(
     pcs : int, default 30
         Number of principal components to use.  Only relevant for
         ``method="harmony"``.
-    scale_per_batch : bool, default True
-        Harmony only.  If True, each batch's intensity matrix is z-scored
-        independently (mean=0, std=1 per feature) before PCA is computed.
-        This removes absolute scale differences between batches (e.g. a 5x
-        intensity offset between instruments) so PCA reflects biology rather
-        than technical scale.  ``adata.X`` is never modified.
-        Ignored when ``adata.obsm["GraphPCA"]`` already exists — delete it
-        first if you want a fresh scaled PCA.
     covariates : list of str, optional
         Additional ``obs`` columns to include in the ComBat design matrix as
         covariates of interest (i.e. biological variation to preserve).
@@ -316,9 +306,6 @@ def batch_correction(
         Passed to ``merge_spatialdata``.  ``"inner"`` keeps only features
         present in all batches; ``"outer"`` keeps all features (missing
         values filled with 0).
-    offset_coords : bool, default True
-        Passed to ``merge_spatialdata``.  Offsets spatial coordinates so
-        batches appear side-by-side rather than overlapping.
     random_state : int, default 42
         Random seed for Harmony.
 
@@ -402,7 +389,6 @@ def batch_correction(
         batch_names=batch_names,
         table_name=table_name,
         feature_join=feature_join,
-        offset_coords=offset_coords,
     )
 
     n_pixels = merged.tables[table_name].n_obs
@@ -420,7 +406,6 @@ def batch_correction(
             batch_col=batch_col,
             random_state=random_state, 
             feature_join=feature_join,
-            offset_coords=offset_coords,
         )
     else:  # combat
         merged = _run_combat(

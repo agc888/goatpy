@@ -238,7 +238,6 @@ def merge_spatialdata(
     sdatas: list,
     batch_names: list[str],
     table_name: str = "maldi_adata",
-    offset_coords: bool = True,
     feature_join: str = "inner",
 ) -> "SpatialData":
     """
@@ -274,9 +273,13 @@ def merge_spatialdata(
     import geopandas as gpd
     import pandas as pd
     import re
+    from scipy.sparse import issparse
     from spatialdata import SpatialData
     from spatialdata.models import Image2DModel, PointsModel, ShapesModel, TableModel
     from spatialdata.transformations import Identity
+
+
+    offset_coords = True
 
     if len(sdatas) != len(batch_names):
         raise ValueError(
@@ -309,9 +312,9 @@ def merge_spatialdata(
     # ------------------------------------------------------------------
     # Report feature overlap
     # ------------------------------------------------------------------
-    all_var_sets     = [set(sd.tables[table_name].var_names) for sd in sdatas]
-    common_features  = set.intersection(*all_var_sets)
-    all_features     = set.union(*all_var_sets)
+    all_var_sets    = [set(sd.tables[table_name].var_names) for sd in sdatas]
+    common_features = set.intersection(*all_var_sets)
+    all_features    = set.union(*all_var_sets)
 
     print("Feature summary:")
     print(f"  Common to all batches   : {len(common_features):,}")
@@ -325,25 +328,148 @@ def merge_spatialdata(
     )
 
     # ------------------------------------------------------------------
+    # Determine the shared feature axis up front so we can slice each
+    # batch to exactly this set (and order) BEFORE concat.
+    # This prevents ad.concat from reordering columns, which would
+    # decouple X rows from their spatial obs metadata.
+    # ------------------------------------------------------------------
+    if feature_join == "inner":
+        shared_vars = sorted(common_features, key=lambda v: float(v) if _is_float(v) else v)
+    else:
+        shared_vars = sorted(all_features, key=lambda v: float(v) if _is_float(v) else v)
+
+    # ------------------------------------------------------------------
     # Main loop — build spatialdata elements and adatas
     # ------------------------------------------------------------------
-    all_images = {}
-    all_points = {}
-    all_shapes = {}
-    all_adatas = []
-    x_offset   = 0.0
+    all_images          = {}
+    all_points          = {}
+    all_shapes          = {}
+    all_adatas          = []
+    per_batch_categoricals = []  # stores {col: [categories]} per batch
+    x_offset            = 0.0
 
     for sdata, batch in zip(sdatas, batch_names):
 
-        adata = sdata.tables[table_name].copy()
-        n_obs = adata.n_obs
+        # ----------------------------------------------------------------
+        # Extract X and obs directly from the underlying AnnData so that
+        # spatialdata's internal indexing/reordering cannot affect row order.
+        # We reconstruct a clean AnnData from scratch to guarantee that
+        # row i of X always corresponds to row i of obs.
+        # ----------------------------------------------------------------
+        src = sdata.tables[table_name]
+        n_obs = src.n_obs
 
-        # Compute this batch's x-width for offset calculation
-        # Uses he_x which is in the native spatialdata coordinate system
+        # --- Dense X, row order preserved ---
+        X_raw = src.X.toarray() if issparse(src.X) else np.array(src.X, dtype=np.float32)
+
+        # Sanity check: X rows must match obs rows
+        assert X_raw.shape[0] == n_obs, (
+            f"[{batch}] X has {X_raw.shape[0]} rows but obs has {n_obs} rows — "
+            "AnnData is internally inconsistent."
+        )
+
+        # Verify spatial obs columns are aligned with X before doing anything
+        if "he_x" in src.obs.columns:
+            he_x_vals = src.obs["he_x"].values
+            # Spot-check: he_x should have the same length as X rows
+            assert len(he_x_vals) == X_raw.shape[0], (
+                f"[{batch}] he_x length {len(he_x_vals)} != X rows {X_raw.shape[0]}"
+            )
+
+        # --- Slice to shared feature set in the correct order ---
+        src_var_index = list(src.var_names)
+        if feature_join == "inner":
+            col_idx = [src_var_index.index(v) for v in shared_vars if v in src_var_index]
+            vars_this_batch = [shared_vars[i] for i, v in enumerate(shared_vars) if v in src_var_index]
+        else:
+            # outer: pad missing columns with zeros
+            col_map = {v: i for i, v in enumerate(src_var_index)}
+            X_padded = np.zeros((n_obs, len(shared_vars)), dtype=np.float32)
+            for j, v in enumerate(shared_vars):
+                if v in col_map:
+                    X_padded[:, j] = X_raw[:, col_map[v]]
+            X_raw = X_padded
+            col_idx = list(range(len(shared_vars)))
+            vars_this_batch = shared_vars
+
+        if feature_join == "inner":
+            X_slice = X_raw[:, col_idx]
+        else:
+            X_slice = X_raw  # already padded above
+
+        # --- Build clean obs DataFrame (positional, no spatialdata linkage) ---
+        obs_clean = src.obs.copy()
+
+        # Drop spatialdata linkage columns — will be reassigned positionally after concat
+        drop_cols = ["instance_id", "region"]
+        obs_clean.drop(columns=drop_cols, errors="ignore", inplace=True)
+
+        # Record which columns are categorical BEFORE converting, so we can
+        # restore them after concat (spatialdata_plot needs real Categoricals)
+        categorical_cols = {
+            col: list(obs_clean[col].cat.categories)
+            for col in obs_clean.select_dtypes("category").columns
+        }
+
+        # Convert categoricals to plain strings so ad.concat does not reorder
+        # rows trying to align category levels across batches
+        for col in list(categorical_cols.keys()):
+            obs_clean[col] = obs_clean[col].astype(str)
+
+        per_batch_categoricals.append(categorical_cols)
+
+        # Assign batch label
+        obs_clean["batch"] = batch
+
+        # Use positional obs_names with batch prefix — guarantees uniqueness
+        obs_names = [f"{batch}_{i}" for i in range(n_obs)]
+
+        # --- Build the clean AnnData ---
+        adata = ad.AnnData(
+            X=X_slice.astype(np.float32),
+            obs=obs_clean,
+            var=pd.DataFrame(index=vars_this_batch if feature_join == "inner" else shared_vars),
+        )
+        adata.obs_names = obs_names
+
+        # Copy obsm (spatial coordinates etc.) — positional, so safe to copy directly
+        for key, arr in src.obsm.items():
+            adata.obsm[key] = np.array(arr, dtype=np.float32)
+
+        # Copy uns (scalefactors, images, transform metadata etc.)
+        import copy
+        adata.uns = copy.deepcopy(dict(src.uns))
+        adata.uns.pop("spatialdata_attrs", None)
+
+        # --- Final alignment assertion ---
+        if "he_x" in adata.obs.columns:
+            assert len(adata.obs["he_x"]) == adata.n_obs, (
+                f"[{batch}] he_x length mismatch after AnnData reconstruction"
+            )
+            assert adata.n_obs == X_slice.shape[0], (
+                f"[{batch}] obs/X row count mismatch after reconstruction"
+            )
+            print(f"  [{batch}] alignment OK: {n_obs:,} pixels, "
+                  f"he_x[0]={adata.obs['he_x'].iloc[0]:.1f}, "
+                  f"X[0,0]={float(X_slice[0,0]):.4f}")
+
+        # --- Compute x_offset width from this batch's spatial coords ---
         if "he_x" in adata.obs.columns:
             batch_width = float(adata.obs["he_x"].max()) + 100.0
         else:
             batch_width = float(adata.obsm["spatial"][:, 0].max()) + 100.0
+
+        # --- Apply spatial offset for side-by-side scanpy plots ---
+        if offset_coords and x_offset != 0.0:
+            if "spatial" in adata.obsm:
+                adata.obsm["spatial"] = adata.obsm["spatial"].copy()
+                adata.obsm["spatial"][:, 0] += x_offset
+            if "spatial" in adata.uns:
+                for lib_id, lib in adata.uns["spatial"].items():
+                    lib["x_offset"] = float(x_offset)
+
+        all_adatas.append(adata)
+        x_offset += batch_width
 
         # ---- Images: stored as-is, keyed by batch, no coord changes ----
         for key, img in sdata.images.items():
@@ -384,56 +510,105 @@ def merge_spatialdata(
                 transformations={"global": Identity()},
             )
 
-        # ---- AnnData ----
-        adata.obs_names     = [f"{batch}_{i}" for i in range(n_obs)]
-        adata.obs["batch"]  = batch
-        adata.obs["batch"]  = adata.obs["batch"].astype("category")
-        pixel_region_key    = _make_key("pixels", batch)
-        adata.obs["region"] = pixel_region_key
-        adata.obs["region"] = adata.obs["region"].astype("category")
-        adata.uns.pop("spatialdata_attrs", None)
-
-        # Modify obsm["spatial"] and uns["spatial"] image coords for
-        # scanpy/squidpy offset plots. Nothing else is touched.
-        if offset_coords and x_offset != 0.0:
-
-            # Shift obsm["spatial"] x-axis only
-            if "spatial" in adata.obsm:
-                adata.obsm["spatial"] = adata.obsm["spatial"].copy()
-                adata.obsm["spatial"][:, 0] += x_offset
-
-            # Shift uns["spatial"] image registration coords so the
-            # thumbnail appears in the right place in sc.pl.spatial
-            if "spatial" in adata.uns:
-                for lib_id, lib in adata.uns["spatial"].items():
-                    sf = lib.get("scalefactors", {}).get("tissue_hires_scalef", 1.0)
-                    # sc.pl.spatial uses obsm["spatial"] directly so the
-                    # image offset just needs to match — we don't move the
-                    # image array itself, only record the shift in uns so
-                    # any downstream code that reads it stays consistent
-                    lib["x_offset"] = float(x_offset)
-
-        all_adatas.append(adata)
-        x_offset += batch_width
-
     # ------------------------------------------------------------------
     # Concatenate AnnData
+    # All adatas now have:
+    #   - identical var order (shared_vars)
+    #   - unique obs_names (batch_i prefix)
+    #   - no spatialdata linkage columns
+    #   - no categoricals that could trigger reordering
+    # So ad.concat is safe to use with axis=0.
     # ------------------------------------------------------------------
     merged_adata = ad.concat(
         all_adatas,
-        join=feature_join,
+        axis=0,
+        join=feature_join,       # vars are pre-aligned so inner == exact here
         fill_value=0.0,
-    )
-    merged_adata.obs["instance_id"] = np.arange(len(merged_adata)).astype(str)
-
-    all_pixel_regions = [_make_key("pixels", b) for b in batch_names]
-    merged_adata.obs["region"] = pd.Categorical(
-        merged_adata.obs["region"],
-        categories=all_pixel_regions,
+        index_unique=None,  # obs_names already unique
     )
 
     # ------------------------------------------------------------------
-    # Build SpatialData
+    # Post-concat alignment verification
+    # ------------------------------------------------------------------
+    offset = 0
+    for batch, adata_orig in zip(batch_names, all_adatas):
+        n = adata_orig.n_obs
+        merged_sub_he_x = merged_adata.obs["he_x"].iloc[offset: offset + n].values if "he_x" in merged_adata.obs.columns else None
+        orig_he_x       = adata_orig.obs["he_x"].values if "he_x" in adata_orig.obs.columns else None
+
+        if merged_sub_he_x is not None and orig_he_x is not None:
+            if not np.allclose(merged_sub_he_x, orig_he_x, atol=1e-3):
+                raise RuntimeError(
+                    f"FATAL: he_x mismatch after concat for batch '{batch}'. "
+                    f"Row order was corrupted. First 5 merged={merged_sub_he_x[:5]}, "
+                    f"orig={orig_he_x[:5]}"
+                )
+            print(f"  [{batch}] post-concat alignment verified ✓")
+        offset += n
+
+    # ------------------------------------------------------------------
+    # Assign fresh instance_id and region linkage
+    # ------------------------------------------------------------------
+    merged_adata.obs["instance_id"] = np.arange(len(merged_adata)).astype(str)
+
+    # Reconstruct region column from batch labels (was dropped earlier)
+    region_values = []
+    for batch, adata_orig in zip(batch_names, all_adatas):
+        pixel_region_key = _make_key("pixels", batch)
+        region_values.extend([pixel_region_key] * adata_orig.n_obs)
+
+    all_pixel_regions = [_make_key("pixels", b) for b in batch_names]
+    merged_adata.obs["region"] = pd.Categorical(
+        region_values,
+        categories=all_pixel_regions,
+    )
+
+    # Restore categorical columns that were temporarily stringified for concat.
+    # spatialdata_plot requires these to be proper Categoricals to render correctly.
+    # Collect all categorical column names across all batches.
+    all_categorical_cols = {}
+    for cat_dict in per_batch_categoricals:
+        for col, cats in cat_dict.items():
+            if col not in all_categorical_cols:
+                all_categorical_cols[col] = set(cats)
+            else:
+                all_categorical_cols[col].update(cats)
+
+    for col, cats in all_categorical_cols.items():
+        if col in merged_adata.obs.columns:
+            # Sort categories: numeric if possible, else alphabetic
+            try:
+                sorted_cats = sorted(cats, key=float)
+            except (ValueError, TypeError):
+                sorted_cats = sorted(cats)
+            merged_adata.obs[col] = pd.Categorical(
+                merged_adata.obs[col].astype(str),
+                categories=[str(c) for c in sorted_cats],
+            )
+
+    # Fix shapes GDF indices to match instance_id so spatialdata_plot
+    # can join the table to the shapes for rendering colour columns.
+    # Each batch's pixels_<batch> shapes must be re-indexed to match the
+    # instance_id values assigned to that batch's rows in merged_adata.
+    offset = 0
+    for batch, adata_orig in zip(batch_names, all_adatas):
+        n = adata_orig.n_obs
+        pixel_region_key = _make_key("pixels", batch)
+        if pixel_region_key in all_shapes:
+            batch_instance_ids = merged_adata.obs["instance_id"].iloc[offset: offset + n].values
+            gdf = all_shapes[pixel_region_key].copy()
+            # Drop any embedded transformation attrs before re-indexing
+            # so ShapesModel.parse doesn't see duplicate transform specs
+            gdf.attrs = {}
+            gdf.index = pd.Index(batch_instance_ids)
+            all_shapes[pixel_region_key] = ShapesModel.parse(
+                gdf,
+                transformations={"global": Identity()},
+            )
+        offset += n
+
+    # ------------------------------------------------------------------
+    # Build SpatialData and attach merged table
     # ------------------------------------------------------------------
     merged = SpatialData(
         images=all_images,
@@ -458,3 +633,12 @@ def merge_spatialdata(
     print(f"  Points : {list(all_points.keys())}")
 
     return merged
+
+
+def _is_float(v: str) -> bool:
+    """Helper: return True if string v can be parsed as float."""
+    try:
+        float(v)
+        return True
+    except (ValueError, TypeError):
+        return False
