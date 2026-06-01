@@ -22,7 +22,8 @@ import scanpy as sc
 def check_batch(
     sdata,
     table_name: str = "maldi_adata",
-    batch_col: str = "batch"
+    batch_col: str = "batch",
+    show: bool = True
 ):
 
     adata = sdata[table_name].copy()
@@ -149,7 +150,8 @@ def check_batch(
     )
 
     plt.tight_layout()
-    plt.show()
+    if show:
+        plt.show()
 
 """
 Spectral visualisation utilities for goatpy.
