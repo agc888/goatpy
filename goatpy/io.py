@@ -224,7 +224,7 @@ def glyco_spatialdata(imzml_path, peaks_path = None, tol = 0.1, pixel_size = 20,
 
     # --- 7. Add to SpatialData ---
     sdata.tables["maldi_adata"] = table
-
+    sdata["maldi_adata"].uns["maldi_path"] = imzml_path
     return sdata
 
 

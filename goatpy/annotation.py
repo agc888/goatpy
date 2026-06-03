@@ -30,12 +30,14 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import shape, Point, box as shapely_box
+from shapely.ops import unary_union
 
 from shapely import transform as shapely_transform
 
 from spatialdata import SpatialData, polygon_query
 from spatialdata.models import ShapesModel
-from spatialdata.transformations import Identity
+from spatialdata.transformations import Identity, get_transformation
+from spatialdata import transform as sd_transform
 
 
 
@@ -187,6 +189,169 @@ def add_qupath_annotations(sdata, geojson_path, shapes_key="annotations",
     return sdata
 
 
+
+def annotations_to_pixels(
+    sdata: SpatialData,
+    shapes_key: str = "annotations",
+    classification_key: str = "classification",
+    table_name: str = "maldi_adata",
+    points_name: str = "centroids",
+    obs_column: str = "annotation",
+    other_label: str = "other",
+    coordinate_system: str = "aligned",
+) -> SpatialData:
+    """
+    Label each pixel in sdata[table_name].obs with its annotation class.
+
+    For each point in sdata.points[points_name], tests whether its (x, y)
+    centroid falls within any polygon in sdata.shapes[shapes_key].
+
+    If coordinate_system='global', geometries and points are used as-is
+    (i.e. automatic alignment where data is already in the correct space).
+    Otherwise both shapes and points are transformed into coordinate_system
+    before the point-in-polygon test (i.e. manual alignment).
+
+    The ID column in the points layer may be named 'instance_id' or 'cell_id';
+    both are handled automatically and normalised to 'instance_id' for the
+    join to adata.obs.
+
+    Parameters
+    ----------
+    sdata              : SpatialData object
+    shapes_key         : key in sdata.shapes holding annotation polygons
+    classification_key : column in the shapes GeoDataFrame with class labels
+    table_name         : key in sdata.tables to annotate
+    points_name        : key in sdata.points holding pixel centroids
+    obs_column         : name of the new column added to adata.obs
+    other_label        : label for pixels outside all polygons
+    coordinate_system  : coordinate system to resolve coordinates in.
+                         Use 'global' for automatic alignment (no transform
+                         needed); use 'aligned' for manual alignment.
+    """
+    # ------------------------------------------------------------------ #
+    # 1. Resolve the ID column name in the points layer                   #
+    # ------------------------------------------------------------------ #
+    points_columns = sdata.points[points_name].columns.tolist()
+    if "instance_id" in points_columns:
+        id_col = "instance_id"
+    elif "cell_id" in points_columns:
+        id_col = "cell_id"
+    else:
+        raise KeyError(
+            f"Neither 'instance_id' nor 'cell_id' found in "
+            f"points['{points_name}']. Available columns: {points_columns}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # 2. Get shapes and points in the target coordinate system            #
+    # ------------------------------------------------------------------ #
+    if coordinate_system == "global":
+        # Automatic alignment — data already in the correct space
+        transformed_shapes = sdata.shapes[shapes_key].copy()
+        points_df = (
+            sdata.points[points_name][["x", "y", id_col]]
+            .compute()
+            .reset_index(drop=True)
+        )
+    else:
+        # Manual alignment — transform both into the target coordinate system
+        transformed_shapes = sd_transform(
+            sdata.shapes[shapes_key], to_coordinate_system=coordinate_system
+        )
+        transformed_points = sd_transform(
+            sdata.points[points_name], to_coordinate_system=coordinate_system
+        )
+        points_df = (
+            transformed_points[["x", "y", id_col]]
+            .compute()
+            .reset_index(drop=True)
+        )
+
+    # Normalise ID column to 'instance_id' for the rest of the function
+    points_df = points_df.rename(columns={id_col: "instance_id"})
+
+    transformed_shapes[classification_key] = (
+        transformed_shapes[classification_key].astype(str)
+    )
+
+    # ------------------------------------------------------------------ #
+    # 3. Build per-class unioned polygons                                 #
+    # ------------------------------------------------------------------ #
+    classes = transformed_shapes[classification_key].unique().tolist()
+
+    class_regions = {
+        cls: unary_union(
+            transformed_shapes.loc[
+                transformed_shapes[classification_key] == cls, "geometry"
+            ].values
+        )
+        for cls in classes
+    }
+
+    # ------------------------------------------------------------------ #
+    # 4. Point-in-polygon test                                            #
+    # ------------------------------------------------------------------ #
+    he_x = points_df["x"].to_numpy(dtype=float)
+    he_y = points_df["y"].to_numpy(dtype=float)
+
+    result = np.full(len(points_df), other_label, dtype=object)
+
+    for cls, region in class_regions.items():
+        try:
+            from shapely import contains_xy
+            mask = contains_xy(region, he_x, he_y)
+        except ImportError:
+            pts = gpd.GeoSeries([Point(x, y) for x, y in zip(he_x, he_y)])
+            mask = pts.within(region).to_numpy()
+
+        result[mask] = cls
+        print(f"  '{cls}': {mask.sum():,} pixels")
+
+    # ------------------------------------------------------------------ #
+    # 5. Join labels back to adata.obs via instance_id                   #
+    # ------------------------------------------------------------------ #
+    points_df["_label"] = result
+
+    adata = sdata.tables[table_name]
+
+    obs = adata.obs.copy()
+    obs["_instance_id_key"] = obs["instance_id"].astype(str)
+    points_df["instance_id"] = points_df["instance_id"].astype(str)
+
+    merged = obs.merge(
+        points_df[["instance_id", "_label"]],
+        left_on="_instance_id_key",
+        right_on="instance_id",
+        how="left",
+    )
+    merged["_label"] = merged["_label"].fillna(other_label)
+
+    all_categories = [other_label] + [c for c in classes if c != other_label]
+    adata.obs[obs_column] = pd.Categorical(
+        merged["_label"].values, categories=all_categories
+    )
+
+    # ------------------------------------------------------------------ #
+    # 6. Summary                                                          #
+    # ------------------------------------------------------------------ #
+    n = len(adata)
+    n_annotated = (adata.obs[obs_column] != other_label).sum()
+    print(
+        f"\n  '{obs_column}' added: {n_annotated:,} / {n:,} pixels annotated "
+        f"({n_annotated / n * 100:.1f}%)"
+    )
+    for cls in all_categories:
+        count = (adata.obs[obs_column] == cls).sum()
+        print(f"    {cls!r:30s}: {count:>8,}  ({count / n * 100:.1f}%)")
+
+    return sdata
+
+
+
+
+
+
+
 def annotate_per_pixel(
     sdata: SpatialData,
     shapes_key: str = "annotations",
@@ -196,7 +361,7 @@ def annotate_per_pixel(
     overlap: float = 0.0,
     other_label: str = "other",
     priority: Optional[list[str]] = None,
-    inplace: bool = True,
+    target_coordinate_system: str = "global",
 ) -> SpatialData:
     """
     Add a categorical ``obs_column`` to ``maldi_adata.obs`` labelling each
@@ -302,7 +467,7 @@ def annotate_per_pixel(
     if overlap <= 0.0:
         _annotate_centroid(
             sdata, ann_gdf, adata, labels,
-            classes, classification_key, shapes_key, table_name,
+            classes, classification_key, target_coordinate_system, table_name,
         )
     else:
         _annotate_area(
@@ -330,46 +495,43 @@ def annotate_per_pixel(
 # ---------------------------------------------------------------------------
 
 def _annotate_centroid(
-    sdata, ann_gdf, adata, labels,
-    classes, classification_key, shapes_key, table_name,
+    ann_gdf, adata, labels,
+    classes, classification_key,
 ):
     """
-    Centroid-based assignment using spatialdata.polygon_query.
+    Centroid-based assignment using x/y from sdata.points['centroids'],
+    joined to adata.obs via instance_id.
 
-    Iterates over each unique class, unions its polygons, runs polygon_query,
-    then stamps matching obs indices with the class label.
     Last class in `classes` wins for overlapping regions.
     """
+    from shapely.ops import unary_union
+    from shapely.vectorized import contains
+
+    # Pull x/y from centroids, compute into pandas, join to adata.obs on instance_id
+    centroids_df = sdata.points["centroids"][["x", "y", "instance_id"]].compute()
+
+    obs = adata.obs.reset_index()  # preserve original index as a column
+    merged = obs.merge(centroids_df, on="instance_id", how="left")
+
+    # Positions in labels array correspond to adata.obs row order
+    he_x = merged["x"].to_numpy(dtype=float)
+    he_y = merged["y"].to_numpy(dtype=float)
+
     for cls in classes:
         cls_geoms = ann_gdf[ann_gdf[classification_key].astype(str) == cls].geometry
         if cls_geoms.empty:
             continue
 
-        from shapely.ops import unary_union
         union_poly = unary_union(cls_geoms.values)
 
         try:
-            result = polygon_query(
-                sdata,
-                polygon=union_poly,
-                target_coordinate_system="global",
-                filter_table=True,
-            )
-            if table_name in result.tables:
-                sub_table = result.tables[table_name]
-                in_poly = sub_table.obs.index
-                # Map back to position in the full adata
-                full_idx = adata.obs.index
-                pos = np.where(full_idx.isin(in_poly))[0]
-                labels[pos] = cls
-                print(f"    polygon_query '{cls}': {len(pos):,} pixels")
-            else:
-                print(f"    polygon_query '{cls}': 0 pixels (no table returned)")
-        except Exception as e:
-            print(f"    polygon_query '{cls}' failed ({e}), falling back to point-in-polygon")
-            _fallback_pip(ann_gdf, adata, labels, cls, classification_key)
+            mask = contains(union_poly, he_x, he_y)
+        except Exception:
+            pts = gpd.GeoSeries([Point(x, y) for x, y in zip(he_x, he_y)])
+            mask = pts.within(union_poly).to_numpy()
 
-
+        labels[mask] = cls
+        print(f"    PIP '{cls}': {mask.sum():,} pixels")
 def _fallback_pip(ann_gdf, adata, labels, cls, classification_key):
     """Point-in-polygon fallback using he_x / he_y centroids."""
     from shapely.ops import unary_union

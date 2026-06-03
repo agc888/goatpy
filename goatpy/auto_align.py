@@ -1366,6 +1366,8 @@ def load_and_align(
 
     sdata["maldi_adata"].uns["he_transform"] = transform_meta
 
+    sdata["maldi_adata"].uns["maldi_path"] = imzml_path
+
     _log(
         f"  Transform stored: mode={'ihc' if use_ihc else 'he'}  "
         f"rotation={best_rot}  "

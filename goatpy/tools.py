@@ -17,6 +17,10 @@ def annotate_glycans(
 ):
 
     adata = sdata[adata_slot].copy()
+
+    if "mz_original" not in adata.var.columns:
+        adata.var["mz_original"] = adata.var_names
+
     original_mz = adata.var_names.astype(str).copy()
 
     names = []
@@ -50,6 +54,9 @@ def annotate_glycans(
 
     for mz in original_mz:
 
+        if str(mz).startswith("mz-"):
+            mz = str(mz)[3:]
+    
         gly_name = []
 
         mz_float = np.float64(mz)
@@ -228,6 +235,9 @@ def annotate_glycans(
                 "be either "
                 "'combine' or 'separate'"
             )
+
+    if "glycans" not in adata.var.columns:
+        adata.var["glycans"] = adata.var_names
 
     sdata[adata_slot] = adata
 
