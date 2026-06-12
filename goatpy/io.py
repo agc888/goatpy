@@ -192,10 +192,14 @@ def glyco_spatialdata(imzml_path, peaks_path = None, tol = 0.1, pixel_size = 20,
                         shapes={"pixels": shapes})
 
 
+    var_df=pd.DataFrame(index=("mz-" + anndata.var.index))
+    var_df["mz_original"] = anndata.var.index
+
+
     adata = AnnData(
         X=anndata.X,
         obs=coords,  # contains x, y, point_id, region
-        var=pd.DataFrame(index=("mz-" + anndata.var.index))
+        var=var_df
     )
 
     adata.obs = pd.concat(

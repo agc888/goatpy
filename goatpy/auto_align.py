@@ -972,7 +972,7 @@ def load_and_align(
     he_path: Optional[str] = None,
     peaks_path: Optional[str] = None,
     geojson_path: Optional[Union[str, Path]] = None,
-    geojson_shapes_key: str = "annotations",
+    geojson_shapes_key: str = "Annotations",
     geojson_classification_key: str = "classification",
     maldi_pixel_um: Optional[float] = None,
     he_pixel_um: Optional[float] = None,
