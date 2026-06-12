@@ -15,6 +15,7 @@ from .tools import annotate_glycans, merge_spatialdata
 from .bin import bin_and_align, bin_imzml
 from .plotting import check_batch, plot_spectrum, plot_spectra_comparison
 from .batch_correction import batch_correction
+from .analysis_gui import launch_goatpy_gui 
 
 __all__ = [
     "Add_Pseudo_Image",
@@ -39,9 +40,8 @@ __all__ = [
     "plot_spectra_comparison",
     "batch_correction",
     "ihc_spatialdata",
-    "annotations_to_pixels"
-
-
+    "annotations_to_pixels",
+    "launch_goatpy_gui"
 ]
 
 __version__ = "0.1.0"
