@@ -15,6 +15,7 @@ from qtpy.QtWidgets import (
     QCheckBox, QSpinBox, QDoubleSpinBox, QApplication, QProgressBar,
     QDialog, QDialogButtonBox, QFileDialog, QListWidget, QListWidgetItem,
     QPlainTextEdit, QTableWidget, QTableWidgetItem, QColorDialog,
+    QSlider,
 )
 from qtpy.QtCore import Qt, Signal, QTimer, QThread, QObject
 from qtpy.QtGui import QCursor, QColor
@@ -793,6 +794,8 @@ class SpectrumWidget(QWidget):
         self._unreg_mz: Optional[float] = None
         self._unreg_tol: float = 0.25
 
+        self._updating_scrollbar: bool = False
+
         # ── m/z list (curated peaks + any added via "Add peak to list") ──
         self.peak_list: list[float] = list(self.peaks)
 
@@ -983,6 +986,15 @@ class SpectrumWidget(QWidget):
         # ── Canvas ────────────────────────────────────────────────────────
         self.canvas = MplCanvas(self, width=10, height=2.6, dpi=90)
         layout.addWidget(self.canvas)
+
+        # ── Horizontal scrollbar for panning across the spectrum ──────────
+        self._scroll_resolution = 10000
+        self.spectrum_scrollbar = QSlider(Qt.Horizontal)
+        self.spectrum_scrollbar.setRange(0, self._scroll_resolution)
+        self.spectrum_scrollbar.setValue(0)
+        self.spectrum_scrollbar.setFixedHeight(14)
+        self.spectrum_scrollbar.valueChanged.connect(self._on_scrollbar_changed)
+        layout.addWidget(self.spectrum_scrollbar)
 
         # ── Interactions ──────────────────────────────────────────────────
         self.canvas.mpl_connect("scroll_event",         self._on_scroll)
@@ -1232,6 +1244,63 @@ class SpectrumWidget(QWidget):
             return self._raw_mz
         return self._sdata_mz
 
+    def _on_scrollbar_changed(self, value: int):
+        """Pan the view in response to the horizontal scrollbar."""
+        if self._updating_scrollbar:
+            return
+
+        mz = self._current_mz()
+        if mz is None:
+            return
+
+        data_lo, data_hi = float(mz.min()), float(mz.max())
+        span = self._view_hi - self._view_lo
+        if span <= 0:
+            return
+
+        max_lo = max(data_lo, data_hi - span)
+        frac = value / self._scroll_resolution
+        new_lo = data_lo + frac * (max_lo - data_lo)
+        new_hi = new_lo + span
+
+        self._view_lo = new_lo
+        self._view_hi = new_hi
+        self.mz_lo.setValue(new_lo)
+        self.mz_hi.setValue(new_hi)
+        self._redraw(update_scrollbar=False)
+
+    def _sync_scrollbar(self):
+        """Update scrollbar position/handle size to reflect the current view."""
+        mz = self._current_mz()
+        if mz is None:
+            return
+
+        data_lo, data_hi = float(mz.min()), float(mz.max())
+        data_span = data_hi - data_lo
+        if data_span <= 0:
+            return
+
+        view_span = self._view_hi - self._view_lo
+        max_lo = max(data_lo, data_hi - view_span)
+
+        # Handle size proportional to visible fraction of the data range
+        frac_visible = min(1.0, view_span / data_span)
+        page_step = max(1, int(self._scroll_resolution * frac_visible))
+
+        if max_lo > data_lo:
+            frac = (self._view_lo - data_lo) / (max_lo - data_lo)
+        else:
+            frac = 0.0
+        value = int(round(frac * self._scroll_resolution))
+
+        self._updating_scrollbar = True
+        try:
+            self.spectrum_scrollbar.setPageStep(page_step)
+            self.spectrum_scrollbar.setValue(max(0, min(self._scroll_resolution, value)))
+            self.spectrum_scrollbar.setEnabled(frac_visible < 1.0)
+        finally:
+            self._updating_scrollbar = False
+
     def _apply_zoom(self):
         self._view_lo = self.mz_lo.value()
         self._view_hi = self.mz_hi.value()
@@ -1248,7 +1317,7 @@ class SpectrumWidget(QWidget):
 
     # ── Drawing ──────────────────────────────────────────────────────────
 
-    def _redraw(self):
+    def _redraw(self, update_scrollbar: bool = True):
         src = self.source_combo.currentText()
         if src == "Raw imzML (full)" and self._raw_mz is not None:
             mz, intensity = self._raw_mz, self._raw_int
@@ -1377,6 +1446,9 @@ class SpectrumWidget(QWidget):
 
         self.canvas.fig.tight_layout(pad=0.4)
         self.canvas.draw()
+
+        if update_scrollbar:
+            self._sync_scrollbar()
 
     # ── Public API ────────────────────────────────────────────────────────
 
