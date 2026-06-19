@@ -350,7 +350,7 @@ def annotations_to_pixels(
 
 
 
-
+### OLD ###
 
 def annotate_per_pixel(
     sdata: SpatialData,
@@ -467,7 +467,7 @@ def annotate_per_pixel(
     if overlap <= 0.0:
         _annotate_centroid(
             sdata, ann_gdf, adata, labels,
-            classes, classification_key, target_coordinate_system, table_name,
+            classes, classification_key
         )
     else:
         _annotate_area(
@@ -494,7 +494,7 @@ def annotate_per_pixel(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _annotate_centroid(
+def _annotate_centroid(sdata,
     ann_gdf, adata, labels,
     classes, classification_key,
 ):
@@ -532,6 +532,7 @@ def _annotate_centroid(
 
         labels[mask] = cls
         print(f"    PIP '{cls}': {mask.sum():,} pixels")
+
 def _fallback_pip(ann_gdf, adata, labels, cls, classification_key):
     """Point-in-polygon fallback using he_x / he_y centroids."""
     from shapely.ops import unary_union
