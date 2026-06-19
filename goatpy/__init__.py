@@ -9,7 +9,7 @@ from .graphpca_mod import graphpca_spatialdata, kneighbors_graph_spatial, get_km
 from .auto_align import load_and_align
 from .preprocessing import normalize_spatialdata
 from .he_image import he_spatialdata, add_annotations
-from .annotation import annotations_to_pixels, annotate_per_pixel
+from .annotation import annotations_to_pixels
 from .filter import filter_spatialdata
 from .tools import annotate_glycans, merge_spatialdata
 from .bin import bin_and_align, bin_imzml
@@ -30,7 +30,6 @@ __all__ = [
     "normalize_spatialdata",
     "add_annotations",
     "filter_spatialdata",
-    "annotate_per_pixel",
     "annotate_glycans",
     "merge_spatialdata",
     "bin_and_align",
