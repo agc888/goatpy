@@ -18,7 +18,7 @@ from qtpy.QtWidgets import (
     QSlider,
 )
 from qtpy.QtCore import Qt, Signal, QTimer, QThread, QObject
-from qtpy.QtGui import QCursor, QColor
+from qtpy.QtGui import QCursor, QColor, QPixmap
 
 # ── matplotlib ───────────────────────────────────────────────────────────────
 import matplotlib
@@ -3440,14 +3440,40 @@ class TipsDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self):
+        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
+        # ── Add logo (optional) ───────────────────────────────────
+        try:
+            from importlib.resources import files
+
+            logo_path = files("goatpy.assets").joinpath("logo.png")
+            pixmap = QPixmap(str(logo_path))
+
+            if not pixmap.isNull():
+                logo = QLabel()
+                logo.setPixmap(
+                    pixmap.scaledToWidth(
+                        180,
+                        Qt.SmoothTransformation,
+                    )
+                )
+                logo.setAlignment(Qt.AlignCenter)
+                layout.addWidget(logo)
+
+        except Exception:
+            # No logo available – continue with the normal dialog
+            pass
+
+        # ── Existing header ───────────────────────────────────────
         header = QLabel("Information & Tips")
         header.setStyleSheet(
-            f"font-size: 16px; font-weight: bold; color: {PALETTE['accent']}; padding-bottom: 4px;"
+            f"font-size: 16px; font-weight: bold; "
+            f"color: {PALETTE['accent']}; padding-bottom: 4px;"
         )
+        header.setAlignment(Qt.AlignCenter)
         layout.addWidget(header)
 
         sub = QLabel("Click a section header to expand its tips.")
