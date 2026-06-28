@@ -731,7 +731,7 @@ class MplCanvas(FigureCanvas):
         super().__init__(self.fig)
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumHeight(180)
+        self.setMinimumHeight(80)   # was 180 — too tall for 13" MacBooks
 
     def _style_ax(self, ax):
         ax.set_facecolor(PALETTE["bg"])
@@ -975,16 +975,23 @@ class SpectrumWidget(QWidget):
         self.progress_bar.hide()
         layout.addWidget(self.progress_bar)
 
-        # ── Hint label ────────────────────────────────────────────────────
-        hint = QLabel(
-            "Scroll to pan  ·  Ctrl+scroll to zoom  ·  Click a red peak line to select glycan  ·  "
-            "'Check unregistered peak' lets you click anywhere on the spectrum"
-        )
-        hint.setStyleSheet(f"color: {PALETTE['text_dim']}; font-size: 9px;")
-        layout.addWidget(hint)
+        # # ── Hint label ────────────────────────────────────────────────────
+        # hint = QLabel(
+        #     "Scroll to pan  ·  Ctrl+scroll to zoom  ·  Click a red peak line to select glycan  ·  "
+        #     "'Check unregistered peak' lets you click anywhere on the spectrum"
+        # )
+        # hint.setStyleSheet(f"color: {PALETTE['text_dim']}; font-size: 9px;")
+        # layout.addWidget(hint)
 
-        # ── Canvas ────────────────────────────────────────────────────────
-        self.canvas = MplCanvas(self, width=10, height=2.6, dpi=90)
+        # ── Canvas ────────────────────────────────────────────────────────────────
+        try:
+            _app = QApplication.instance()
+            _screen_h = _app.primaryScreen().availableGeometry().height() if _app else 900
+        except Exception:
+            _screen_h = 900
+        _canvas_h_in = min(2.6, max(1.4, (_screen_h * 0.22) / 90))  # dpi=90
+
+        self.canvas = MplCanvas(self, width=10, height=_canvas_h_in, dpi=90)
         layout.addWidget(self.canvas)
 
         # ── Horizontal scrollbar for panning across the spectrum ──────────
@@ -3303,14 +3310,25 @@ class AnalysisSidebar(QWidget):
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def _configure_viewer_window(viewer, screen_height: int = 1080):
+def _configure_viewer_window(viewer, screen_height: int = None):
     from qtpy.QtCore import QTimer
 
     def _setup():
         win = viewer.window._qt_window
-    
-        # ── 1. Resize window ──────────────────────────────────────────────
-        h = int(screen_height * 0.90)
+        
+        _install_info_bar(viewer)
+
+        # ── 1. Detect real available screen size ──────────────────────────
+        app = QApplication.instance()
+        if screen_height is not None:
+            avail_h = screen_height
+        elif app is not None:
+            screen = app.primaryScreen()
+            avail_h = screen.availableGeometry().height()
+        else:
+            avail_h = 900  # safe fallback
+
+        h = int(avail_h * 0.88)   # leave room for macOS menu bar + dock
         w = int(h * 16 / 9)
         win.resize(w, h)
 
@@ -3329,13 +3347,304 @@ def _configure_viewer_window(viewer, screen_height: int = 1080):
                 sizes = sp.sizes()
                 total = sum(sizes)
                 if total > 100 and len(sizes) >= 2:
-                    bottom = int(total * 0.28)
+                    # On small screens (< 900px), give spectrum less room
+                    frac = 0.22 if avail_h < 900 else 0.28
+                    bottom = int(total * frac)
                     top = total - bottom
                     new_sizes = [top] + [bottom] * (len(sizes) - 1)
                     sp.setSizes(new_sizes)
                     break
 
     QTimer.singleShot(500, _setup)
+
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Tips dialog
+# ════════════════════════════════════════════════════════════════════════════
+
+class TipsDialog(QDialog):
+    """Popup explaining tooltips/usage for each goatpy widget."""
+
+    TIPS = {
+        "Spectrum Widget": [
+            ("Scroll",            "Pan left/right across the m/z axis"),
+            ("Ctrl + Scroll",     "Zoom in/out around the cursor position"),
+            ("Click red line",    "Select that curated glycan peak — updates the H&E viewer and Analysis sidebar"),
+            ("Zoom to: Go",       "Jump to a specific m/z range"),
+            ("Reset",             "Restore the full m/z range view"),
+            ("Show applied tol.", "Overlay a ± window around each curated peak showing the extraction tolerance"),
+            ("Check unreg. peak", "Enter free-click mode: click anywhere on the spectrum to pick an arbitrary m/z"),
+            ("Display spatially", "Render the selected unregistered m/z as an ion map on the H&E viewer"),
+            ("Add peak to list",  "Append the selected m/z to an in-session list for later export"),
+            ("Export list",       "Save the accumulated m/z list to a CSV file"),
+        ],
+        "Glycan Tab": [
+            ("Select Glycan",     "Choose a curated glycan/peak from the dropdown (supports free-text search)"),
+            ("Show on H&E Viewer","Colour the 'pixels' Shapes layer by intensity for the selected glycan"),
+            ("Ion map colormap",  "Change the continuous colormap applied to the ion map"),
+            ("Violin / Box",      "Plot intensity distribution of the selected glycan grouped by a metadata column"),
+            ("Histogram",         "Plot a histogram of per-pixel intensities for the selected glycan"),
+        ],
+        "Metadata Tab": [
+            ("Shapes layer",      "Choose which SpatialData shapes element to colour"),
+            ("Metadata column",   "Column from obs (for 'pixels') or the shapes GeoDataFrame to visualise"),
+            ("Type indicator",    "Shows whether the column is detected as categorical or continuous"),
+            ("Colormap",          "Categorical columns use discrete palettes; continuous use sequential ones"),
+            ("Show on H&E Viewer","Apply the selected column's values as colours on the chosen shapes layer"),
+        ],
+        "UMAP Tab": [
+            ("Colour by",         "Colour UMAP points by a metadata column or a glycan's per-pixel intensity"),
+            ("Embedding",         "Select which obsm key to use (e.g. X_umap, X_pca)"),
+            ("Plot UMAP",         "Render the 2-D embedding with the chosen colouring"),
+        ],
+        "Heatmap Tab": [
+            ("Group by",          "Categorical obs column used to average intensities per group"),
+            ("Top N peaks",       "Number of highest-variance peaks to display (default 30)"),
+            ("Normalise",         "z-score, min-max, or raw mean intensity"),
+            ("Select Glycans…",   "Pick a custom subset of glycans by name, m/z, or file upload"),
+            ("Clear Selection",   "Revert to automatic top-N peak selection"),
+        ],
+        "Annotations Tab": [
+            ("Table",             "Edit classification labels and colours for existing annotations"),
+            ("Colour picker",     "Click the colour swatch in a row to change that annotation's colour"),
+            ("Construct Annot.",  "Add a new annotation row with a label and colour — then draw the region in napari"),
+            ("Finish Annotation", "Register the shape you just drew and link it to the pending annotation row"),
+            ("Save Changes",      "Write all label/colour edits back to sdata.shapes['Annotations']"),
+            ("Reload",            "Refresh the table from the current sdata.shapes['Annotations'] state"),
+        ],
+        "Stats Tab": [
+            ("TIC distribution",  "Histogram of total ion current (sum of all peaks) per pixel"),
+            ("Peaks / pixel",     "Number of non-zero peaks detected per pixel"),
+            ("Peak frequency",    "Percentage of pixels in which each peak is non-zero"),
+            ("Cluster sizes",     "Bar chart of cell counts per cluster (uses first available cluster column)"),
+            ("Refresh",           "Recompute all four panels from the current adata state"),
+        ],
+        "Napari Viewer": [
+            ("Layer list",        "Toggle layer visibility with the eye icon; drag to reorder"),
+            ("Layer controls",    "Opacity, colormap, and contrast controls for the selected layer"),
+            ("Scroll (canvas)",   "Zoom the spatial view"),
+            ("Click + drag",      "Pan the spatial view"),
+            ("Shapes tools",      "Rectangle / polygon tools for drawing annotation regions"),
+            ("Window menu",       "Show/hide Spectrum, Analysis, Layer Controls, and Layer List panels"),
+        ],
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("goatpy — Information & Tips")
+        self.setMinimumWidth(640)
+        self.setMinimumHeight(500)
+        self.setStyleSheet(BASE_STYLE)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        header = QLabel("Information & Tips")
+        header.setStyleSheet(
+            f"font-size: 16px; font-weight: bold; color: {PALETTE['accent']}; padding-bottom: 4px;"
+        )
+        layout.addWidget(header)
+
+        sub = QLabel("Click a section header to expand its tips.")
+        sub.setStyleSheet(f"color: {PALETTE['text_dim']}; font-size: 10px;")
+        layout.addWidget(sub)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(4)
+
+        for section, entries in self.TIPS.items():
+            container_layout.addWidget(self._make_section(section, entries))
+
+        container_layout.addStretch()
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+        close_btn = QPushButton("Close")
+        close_btn.setFixedWidth(100)
+        close_btn.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+
+    def _make_section(self, title: str, entries: list[tuple[str, str]]) -> QWidget:
+        """Collapsible section: clicking the header toggles the body."""
+        wrapper = QWidget()
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0)
+        wrapper_layout.setSpacing(0)
+
+        # Header button (acts as toggle)
+        header_btn = QPushButton(f"▶  {title}")
+        header_btn.setCheckable(True)
+        header_btn.setChecked(False)
+        header_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {PALETTE['surface']};
+                color: {PALETTE['text']};
+                border: 1px solid {PALETTE['border']};
+                border-radius: 4px;
+                padding: 7px 12px;
+                font-weight: bold;
+                font-size: 11px;
+                text-align: left;
+            }}
+            QPushButton:checked {{
+                background-color: {PALETTE['border']};
+                color: {PALETTE['accent']};
+                border-color: {PALETTE['accent']};
+            }}
+            QPushButton:hover {{
+                background-color: {PALETTE['border']};
+            }}
+        """)
+
+        # Body table
+        body = QWidget()
+        body.setVisible(False)
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(8, 4, 8, 8)
+        body_layout.setSpacing(0)
+
+        table = QTableWidget(len(entries), 2)
+        table.setHorizontalHeaderLabels(["Action / Control", "Description"])
+        table.horizontalHeader().setStretchLastSection(True)
+        table.horizontalHeader().setStyleSheet(
+            f"QHeaderView::section {{ background-color: {PALETTE['bg']}; "
+            f"color: {PALETTE['accent']}; font-weight: bold; border: none; padding: 4px; }}"
+        )
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.NoSelection)
+        table.setShowGrid(False)
+        table.setAlternatingRowColors(True)
+        table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {PALETTE['bg']};
+                alternate-background-color: {PALETTE['surface']};
+                border: none;
+                gridline-color: {PALETTE['border']};
+            }}
+            QTableWidget::item {{ padding: 5px 8px; color: {PALETTE['text']}; border: none; }}
+        """)
+        table.setColumnWidth(0, 180)
+        table.setMinimumHeight(len(entries) * 30 + 30)
+
+        for row_i, (action, desc) in enumerate(entries):
+            action_item = QTableWidgetItem(action)
+            action_item.setForeground(QColor(PALETTE["highlight"]))
+            desc_item = QTableWidgetItem(desc)
+            table.setItem(row_i, 0, action_item)
+            table.setItem(row_i, 1, desc_item)
+
+        body_layout.addWidget(table)
+        wrapper_layout.addWidget(header_btn)
+        wrapper_layout.addWidget(body)
+
+        def _toggle(checked, btn=header_btn, b=body):
+            b.setVisible(checked)
+            btn.setText(("▼  " if checked else "▶  ") + title)
+
+        header_btn.toggled.connect(_toggle)
+        return wrapper
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Info bar (replaces napari status bar)
+# ════════════════════════════════════════════════════════════════════════════
+
+from qtpy.QtCore import QObject, QEvent
+
+class _StatusBarTextBlocker(QObject):
+    """
+    Event filter installed on the QStatusBar that intercepts any attempt
+    by napari to write keybinding hint text into the bar's message area.
+    """
+    def eventFilter(self, obj, event):
+        # Block StatusTip and WhatsThis events that carry hint text
+        if event.type() in (QEvent.StatusTip, QEvent.WhatsThis):
+            return True
+        return super().eventFilter(obj, event)
+
+
+def _install_info_bar(viewer) -> None:
+    from qtpy.QtWidgets import QStatusBar, QLabel, QPushButton
+    from qtpy.QtCore import QObject, QEvent, QTimer
+
+    win = viewer.window._qt_window
+    status: QStatusBar = win.statusBar()
+
+    # ── 1. Nuke the hint label and block all future text ──────────────────
+
+    # Hide any existing child labels
+    for widget in status.findChildren(QLabel):
+        widget.hide()
+        widget.setFixedWidth(0)
+
+    # Override showMessage and clearMessage at the Python level
+    def _noop(*args, **kwargs):
+        pass
+    status.showMessage = _noop
+
+    # Install event filter to catch lower-level status tip events
+    blocker = _StatusBarTextBlocker(status)
+    status.installEventFilter(blocker)
+    win.installEventFilter(blocker)   # also block at window level
+
+    # Napari writes the hint text via a QTimer after tool changes —
+    # repeatedly clear the message for the first few seconds after launch
+    def _clear():
+        # Call the real C++ clearMessage, bypassing our noop override
+        QStatusBar.clearMessage(status)
+        # Also hide any labels that reappeared
+        for w in status.findChildren(QLabel):
+            if w.isVisible() and w.text():
+                w.hide()
+                w.setFixedWidth(0)
+
+    # Fire several times to catch delayed napari hint refreshes
+    for delay_ms in (800, 1200, 1800, 2500, 3500):
+        QTimer.singleShot(delay_ms, _clear)
+
+    # Keep a reference so the blocker isn't garbage collected
+    _GOATPY_REFS["_status_blocker"] = blocker
+
+    # ── 2. Insert Tips button on the left ─────────────────────────────────
+    tips_btn = QPushButton("ℹ  Information / Tips")
+    tips_btn.setFixedHeight(20)
+    tips_btn.setStyleSheet(f"""
+        QPushButton {{
+            background-color: transparent;
+            color: {PALETTE['accent']};
+            border: 1px solid {PALETTE['accent']};
+            border-radius: 3px;
+            padding: 0 10px;
+            font-size: 10px;
+            font-weight: bold;
+        }}
+        QPushButton:hover {{ background-color: {PALETTE['border']}; }}
+        QPushButton:pressed {{ background-color: {PALETTE['accent']}; color: white; }}
+    """)
+    tips_btn.clicked.connect(lambda: TipsDialog(win).exec_())
+
+    status.insertPermanentWidget(0, tips_btn)
+    status.show()
+
+
+
+
+
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # 3. MAIN LAUNCH FUNCTION
@@ -3348,6 +3657,7 @@ def launch_goatpy_gui(
     table_name: str = "maldi_adata",
     viewer: Optional[napari.Viewer] = None,
     applied_tolerance: float = 0.1,
+    screen_height: int = 1080
 ) -> napari.Viewer:
 
     if peaks is None:
@@ -3380,20 +3690,84 @@ def launch_goatpy_gui(
     # ── Keep Interactive alive (don't let it be GC'd) ─────────────────────
     _GOATPY_REFS["interactive"] = interactive
 
-    # ── Spectrum widget ────────────────────────────────────────────────────
+    # In launch_goatpy_gui, replace the two add_dock_widget calls:
+
+    # ── Spectrum widget ────────────────────────────────────────────────────────
     spectrum_widget = SpectrumWidget(
         sdata=sdata, peaks=peaks, glycan_df=glycan_df, table_name=table_name,
         applied_tolerance=applied_tolerance,
     )
-    viewer.window.add_dock_widget(spectrum_widget, area="bottom", name="Spectrum")
+    spectrum_dock = viewer.window.add_dock_widget(
+        spectrum_widget,
+        area="bottom",
+        name="Spectrum",        # this name appears in the Window menu
+    )
 
-    # ── Sidebar widget ─────────────────────────────────────────────────────
+    # ── Sidebar widget ─────────────────────────────────────────────────────────
     sidebar = AnalysisSidebar(
         sdata=sdata, peaks=peaks, viewer=viewer,
         glycan_df=glycan_df, table_name=table_name,
     )
-    viewer.window.add_dock_widget(sidebar, area="right", name="Analysis")
+    analysis_dock = viewer.window.add_dock_widget(
+        sidebar,
+        area="right",
+        name="Analysis",        # this name appears in the Window menu
+    )
 
+    # ── Make them appear in Window menu with toggle actions ────────────────────
+    def _register_dock_in_window_menu(viewer, dock, name: str):
+        """
+        Ensures the dock widget appears in napari's Window menu
+        as a checkable toggle action, matching how napari registers
+        its own built-in panels (Layer Controls, Layer List, etc.).
+        """
+        from qtpy.QtWidgets import QDockWidget, QMenuBar, QMenu
+        from qtpy.QtGui import QAction
+
+        # napari wraps our widget in a QDockWidget — find it
+        qt_dock = None
+        if isinstance(dock, QDockWidget):
+            qt_dock = dock
+        else:
+            # add_dock_widget may return the inner widget; walk up to the QDockWidget
+            parent = getattr(dock, "parent", lambda: None)()
+            while parent is not None:
+                if isinstance(parent, QDockWidget):
+                    qt_dock = parent
+                    break
+                parent = getattr(parent, "parent", lambda: None)()
+
+        if qt_dock is None:
+            return
+
+        qt_dock.setObjectName(name)          # stable ID for Qt's save/restore
+
+        # Find the Window menu in napari's menubar
+        win = viewer.window._qt_window
+        menubar: QMenuBar = win.menuBar()
+        window_menu: QMenu = None
+        for action in menubar.actions():
+            if action.text().lower().strip("&") in ("window", "&window"):
+                window_menu = action.menu()
+                break
+
+        if window_menu is None:
+            return
+
+        # Avoid duplicates — napari sometimes auto-adds it already
+        existing_titles = {a.text() for a in window_menu.actions()}
+        if name in existing_titles:
+            return
+
+        toggle_action = qt_dock.toggleViewAction()
+        toggle_action.setText(name)
+        window_menu.addAction(toggle_action)
+
+    QTimer.singleShot(600, lambda: _register_dock_in_window_menu(viewer, spectrum_dock, "Spectrum"))
+    QTimer.singleShot(600, lambda: _register_dock_in_window_menu(viewer, analysis_dock, "Analysis"))
+
+
+    
     # ── Wiring ─────────────────────────────────────────────────────────────
     sidebar.glycan_selected.connect(
         lambda mz, lbl: spectrum_widget.highlight_glycan(mz, lbl)
@@ -3406,61 +3780,17 @@ def launch_goatpy_gui(
         f"{len(sdata.tables[table_name])} pixels · {len(peaks)} peaks"
     )
 
-    _configure_viewer_window(viewer)
+    _configure_viewer_window(viewer, screen_height=screen_height)
+
+    # In launch_goatpy_gui, after _configure_viewer_window(viewer):
+    _GOATPY_REFS["info_bar"] = None   # filled by _install_info_bar inside _setup
+
+    # Optional helper to push a message from anywhere in the app:
+    def post_info(text: str):
+        bar = _GOATPY_REFS.get("info_bar")
+        if bar is not None:
+            bar.set_message(text)
 
     return viewer
 
 
-
-
-
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Standalone test with dummy data
-# ════════════════════════════════════════════════════════════════════════════
-
-def _make_dummy_sdata() -> SpatialData:
-    import anndata as ad
-    import geopandas as gpd
-    from shapely.geometry import box
-    from spatialdata.models import TableModel, ShapesModel, PointsModel
-    from spatialdata.transformations import Identity
-
-    np.random.seed(42)
-    n, n_peaks = 400, 40
-    peaks_mz = np.sort(np.random.uniform(900, 2800, n_peaks))
-    X = np.abs(np.random.randn(n, n_peaks)).astype(np.float32)
-    he_x = np.random.uniform(0, 1000, n)
-    he_y = np.random.uniform(0, 800, n)
-
-    obs = pd.DataFrame({
-        "he_x": he_x, "he_y": he_y,
-        "GPCA_clusters": pd.Categorical(np.random.choice(["0","1","2","3"], n)),
-        "MPI": X.sum(axis=1),
-    })
-    adata = ad.AnnData(X=X, obs=obs)
-    adata.var_names = [f"{m:.4f}" for m in peaks_mz]
-    adata.obsm["spatial"] = obs[["he_x", "he_y"]].values
-    adata.obsm["GraphPCA"] = np.random.randn(n, 10).astype(np.float32)
-
-    geoms = [box(x-2, y-2, x+2, y+2) for x, y in zip(he_x, he_y)]
-    gdf = gpd.GeoDataFrame({"cell_id": np.arange(n).astype(str)}, geometry=geoms)
-    shapes = ShapesModel.parse(gdf, transformations={"global": Identity()})
-    pts = pd.DataFrame({"x": he_x, "y": he_y, "cell_id": np.arange(n).astype(str)})
-    centroids = PointsModel.parse(pts)
-
-    sdata = SpatialData(shapes={"pixels": shapes}, points={"centroids": centroids})
-    adata.obs["instance_id"] = gdf.index
-    adata.obs["region"] = pd.Categorical(["pixels"] * n)
-    table = TableModel.parse(adata, region="pixels",
-                             region_key="region", instance_key="instance_id")
-    sdata["maldi_adata"] = table
-
-    # Add a dummy H&E image (1000×800 pink noise)
-    from spatialdata.models import Image2DModel
-    he = np.random.randint(200, 255, (3, 800, 1000), dtype=np.uint8)
-    sdata["he_image"] = Image2DModel.parse(
-        he, dims=("c","y","x"), transformations={"global": Identity()}
-    )
-    return sdata
