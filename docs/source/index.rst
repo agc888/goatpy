@@ -15,8 +15,9 @@ mass spectrometry imaging with H&E histology registration and analysis.
    :maxdepth: 2
    :caption: Tutorials
 
-   guides/Tutorials/ihc_alignment
    guides/Tutorials/multi_sample_analysis
+   guides/Tutorials/interactive_analysis_gui
+   guides/Tutorials/ihc_alignment
 
 
 .. toctree::
