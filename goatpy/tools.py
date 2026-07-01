@@ -1,10 +1,11 @@
-from spatialdata import SpatialData
 import numpy as np
 import pandas as pd
+import pkg_resources
 
 from pathlib import Path
-import pkg_resources
+from spatialdata import SpatialData
 from collections import defaultdict
+from anndata import AnnData
 
 
 def annotate_glycans(
@@ -86,8 +87,8 @@ def annotate_glycans(
         else:
             names.append(gly_name[0])
 
-
     adata.var_names = names
+
 
     # Statistics
     var_names = list(adata.var_names)
@@ -186,43 +187,60 @@ def annotate_glycans(
     # Handle duplicate var_names
     duplicated = adata.var_names.duplicated()
 
+
     if duplicated.any():
+        
         if duplicate_glycans == "combine":
 
             X = adata.X
 
-            if not isinstance(
-                X,
-                np.ndarray
-            ):
-
+            if not isinstance(X, np.ndarray):
                 X = X.toarray()
 
             df = pd.DataFrame(
                 X,
-                columns=adata.var_names
+                columns=adata.var_names.astype(str)
             )
 
-            # Combine duplicate glycans
+            # --- combine expression matrix ---
             df_combined = (
-                df.groupby(
-                    axis=1,
-                    level=0
-                ).sum()
+                df.T
+                .groupby(level=0, sort=False)
+                .sum()
+                .T
             )
 
-            adata = adata[
-                :,
-                :df_combined.shape[1]
-            ].copy()
+            # --- rebuild var metadata ---
+            var = adata.var.copy()
+            var["glycans"] = adata.var_names.astype(str)
+            var["mz_original"] = var["mz_original"].astype(str)
 
-            adata.X = (
-                df_combined.values
+            var_combined = (
+                var
+                .groupby("glycans", sort=False)
+                .agg(
+                    mz_original=("mz_original", "first"),
+                    duplicates=("mz_original", lambda x: ",".join(x))
+                )
             )
 
-            adata.var_names = (
-                df_combined.columns
-            )
+            var_combined.index.name = None
+
+            # Keep first occurrence of each glycan so dimensions match
+            keep = ~adata.var_names.duplicated()
+
+            # Subset existing AnnData (preserves obs, obsm, uns, layers, etc.)
+            adata = adata[:, keep].copy()
+
+            # Make sure metadata order matches expression matrix
+            var_combined = var_combined.loc[df_combined.columns]
+
+            # Replace matrix and metadata
+            adata.X = df_combined.values
+            adata.var = var_combined
+            adata.var_names = var_combined.index
+
+
 
         elif duplicate_glycans == "separate":
 
@@ -238,6 +256,9 @@ def annotate_glycans(
 
     if "glycans" not in adata.var.columns:
         adata.var["glycans"] = adata.var_names
+    
+    if "duplicates" in adata.var.columns:
+        adata.var = adata.var[["mz_original", "glycans", "duplicates"]]
 
     sdata[adata_slot] = adata
 

@@ -251,6 +251,47 @@ def _resolve_mz_array(adata) -> np.ndarray:
         mzs[nan_mask] = np.where(nan_mask)[0].astype(np.float64)
     return mzs
 
+def _load_glycan_reference_table() -> pd.DataFrame:
+    """
+    Load the curated theoretical-mass reference table bundled with goatpy
+    (goatpy/data/glycan_list.csv). Columns are normalised to 'mz' (theoretical
+    m/z [M+Na]) and 'label' (composition / glycan name).
+    """
+    df = None
+
+    # Preferred: package data access (works when goatpy is installed)
+    try:
+        from importlib.resources import files
+        path = files("goatpy").joinpath("data", "glycan_list.csv")
+        df = pd.read_csv(path)
+    except Exception:
+        df = None
+
+    # Fallback: locate relative to this source file (dev / editable installs)
+    if df is None:
+        try:
+            import pathlib
+            here = pathlib.Path(__file__).resolve()
+            for parent in here.parents:
+                candidate = parent / "data" / "glycan_list.csv"
+                if candidate.exists():
+                    df = pd.read_csv(candidate)
+                    break
+        except Exception:
+            df = None
+
+    if df is None:
+        print("[goatpy GUI] Could not locate glycan_list.csv — "
+              "theoretical-mass lookup will be unavailable.")
+        return pd.DataFrame(columns=["mz", "label"])
+
+    df = df.rename(columns={
+        "Theoretical m/z [M+Na]": "mz",
+        "Composition": "label",
+    })
+    df["mz"] = pd.to_numeric(df["mz"], errors="coerce")
+    df["label"] = df["label"].astype(str).str.strip()
+    return df.dropna(subset=["mz"]).reset_index(drop=True)
 
 def _resolve_var_display_labels(adata) -> list[str]:
     mzs = _resolve_mz_array(adata)
@@ -786,6 +827,8 @@ class SpectrumWidget(QWidget):
             pass
 
         self.highlighted_mz: Optional[float] = None
+        self.annotated_highlight_mzs: list[float] = []
+        self.annotated_highlight_tol: float = 0.5
         self.highlighted_label: str = ""
         self._tol = 0.15
 
@@ -1359,6 +1402,16 @@ class SpectrumWidget(QWidget):
                         linewidth=1.0, linestyle="--", alpha=0.7, zorder=3,
                         picker=5,
                     )
+        
+        # ── Annotated peaks (green) ─────────────────────────────────────
+        if self.annotated_highlight_mzs:
+            tol = self.annotated_highlight_tol
+            for pk in self.annotated_highlight_mzs:
+                if (pk - tol) <= hi and (pk + tol) >= lo:
+                    ax.axvspan(pk - tol, pk + tol,
+                               color=PALETTE["success"], alpha=0.25, zorder=3.5)
+                    ax.axvline(pk, color=PALETTE["success"],
+                               linewidth=1.3, alpha=0.9, zorder=4)
 
         # ── Applied tolerance (red outline: baseline -> peak -> baseline) ──
         if self.show_applied_tol_cb.isChecked():
@@ -1424,6 +1477,14 @@ class SpectrumWidget(QWidget):
                 Line2D([0], [0], color=PALETTE["peak_marker"], linewidth=1,
                        linestyle="--", label=f"Curated peaks (n={len(self.peaks)})")
             )
+        if self.annotated_highlight_mzs:
+            handles.append(
+                mpatches.Patch(
+                    color=PALETTE["success"], alpha=0.5,
+                    label=f"Annotated (n={len(self.annotated_highlight_mzs)}, "
+                          f"±{self.annotated_highlight_tol:.3f} Da)",
+                )
+            )
         if self.highlighted_mz is not None:
             handles.append(
                 mpatches.Patch(color=PALETTE["highlight"], alpha=0.5,
@@ -1484,6 +1545,26 @@ class SpectrumWidget(QWidget):
         self.highlighted_mz = None
         self.highlighted_label = ""
         self._redraw()
+
+
+    def set_annotated_highlights(self, mzs: list[float], tol: float):
+        """Highlight all successfully-annotated peaks in green, ± tol Da."""
+        self.annotated_highlight_mzs = list(mzs)
+        self.annotated_highlight_tol = float(tol)
+        self._redraw()
+
+    def clear_annotated_highlights(self):
+        self.annotated_highlight_mzs = []
+        self._redraw()
+
+    def update_peak_labels(self, label_map: dict[float, str]):
+        """Refresh peak->name lookup after names are edited in the Nomenclature tab."""
+        for mz, lbl in label_map.items():
+            if lbl:
+                self._peak_labels[float(mz)] = lbl
+        self._redraw()
+
+
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1684,6 +1765,8 @@ class AnalysisSidebar(QWidget):
     """
 
     glycan_selected = Signal(float, str)   # mz, display_label
+    show_annotated_on_spectra = Signal(list, float)   # mzs, tolerance
+    nomenclature_updated = Signal(dict)                # mz -> new label
 
     def __init__(
         self,
@@ -1706,6 +1789,8 @@ class AnalysisSidebar(QWidget):
         self._last_meta_render: Optional[dict] = None
 
         self._build_glycan_lookup()
+        self.glycan_reference_df = _load_glycan_reference_table()
+        self._build_theoretical_mz_lookup()
         self._build_ui()
 
     # ── Data helpers ──────────────────────────────────────────────────────
@@ -1789,6 +1874,53 @@ class AnalysisSidebar(QWidget):
             names.append(best_label)
         self.glycan_names = names
 
+        self.nomenclature_labels: dict[float, str] = {
+            pk: self._clean_glycan_name(pk) for pk in self.peaks
+        }
+
+    def _build_theoretical_mz_lookup(self):
+        self.peak_theoretical_mz: dict[float, float] = {}
+        ref = getattr(self, "glycan_reference_df", None)
+        if ref is None or ref.empty:
+            return
+
+        for pk in self.peaks:
+            name = self.nomenclature_labels.get(pk, "") if hasattr(self, "nomenclature_labels") else ""
+            if not name:
+                continue
+
+            matches = ref[ref["label"].str.lower() == name.strip().lower()]
+            if matches.empty:
+                continue
+
+            # If multiple rows share the same name, pick the theoretical
+            # mass that produces the smallest absolute delta to the observed peak.
+            best_theo = matches.loc[
+                (matches["mz"] - pk).abs().idxmin(), "mz"
+            ]
+            self.peak_theoretical_mz[pk] = float(best_theo)
+
+
+    def _on_nomenclature_row_clicked(self, row: int, col: int):
+        if row < 0 or row >= len(self.peaks):
+            return
+        pk = self.peaks[row]
+        name = self.nomenclature_labels.get(pk, "") or f"{pk:.4f}"
+        # Reuse the existing glycan_selected signal — already wired to
+        # spectrum_widget.highlight_glycan in launch_goatpy_gui
+        self.glycan_selected.emit(pk, name)
+
+    def _clean_glycan_name(self, pk: float) -> str:
+        """Return just the glycan name for a peak (blank if unannotated)."""
+        nearest = min(self.mz_to_label.keys(), key=lambda m: abs(m - pk), default=None)
+        if nearest is not None and abs(nearest - pk) < 0.5:
+            lbl = self.mz_to_label[nearest]
+            if not _looks_numeric(lbl):
+                return lbl
+        return ""
+
+
+
     def _adata(self):
         return self.sdata.tables[self.table_name]
 
@@ -1823,6 +1955,7 @@ class AnalysisSidebar(QWidget):
         self.tabs.addTab(self._build_umap_tab(),     "UMAP")
         self.tabs.addTab(self._build_heatmap_tab(),  "Heatmap")
         self.tabs.addTab(self._build_annotations_tab(), "Annotations")
+        self.tabs.addTab(self._build_nomenclature_tab(), "Nomenclature")   # ← new
         self.tabs.addTab(self._build_stats_tab(),    "Stats")
 
     # ── Glycan tab ────────────────────────────────────────────────────────
@@ -2436,6 +2569,200 @@ class AnalysisSidebar(QWidget):
         self.hmap_canvas = MplCanvas(w, width=4.5, height=5.5, dpi=90)
         layout.addWidget(self.hmap_canvas)
         return w
+
+
+    # ── Nomenclature tab ────────────────────────────────────────────────
+
+    def _build_nomenclature_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        info = QLabel("Curated m/z values and their assigned glycan names.")
+        info.setStyleSheet(f"color: {PALETTE['text_dim']}; font-size: 9px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.nomenclature_table = QTableWidget()
+        self.nomenclature_table.setColumnCount(3)
+        self.nomenclature_table.setHorizontalHeaderLabels(["m/z (observed)", "Glycan", "Δ m/z"])
+        self.nomenclature_table.horizontalHeader().setStretchLastSection(True)
+        self.nomenclature_table.setColumnWidth(0, 100)
+        self.nomenclature_table.setColumnWidth(2, 80)
+        layout.addWidget(self.nomenclature_table)
+        self._populate_nomenclature_table()
+        self.nomenclature_table.cellClicked.connect(self._on_nomenclature_row_clicked)
+
+        edit_row = QHBoxLayout()
+        self.edit_names_btn = QPushButton("Edit Names")
+        self.edit_names_btn.setCheckable(True)
+        self.edit_names_btn.toggled.connect(self._on_toggle_edit_names)
+        edit_row.addWidget(self.edit_names_btn)
+
+        self.save_names_btn = QPushButton("Save Changes")
+        self.save_names_btn.clicked.connect(self._on_save_nomenclature)
+        edit_row.addWidget(self.save_names_btn)
+        layout.addLayout(edit_row)
+
+        spectra_grp = QGroupBox("Show on Spectra")
+        spectra_layout = QHBoxLayout(spectra_grp)
+        spectra_layout.addWidget(QLabel("Tolerance (± Da):"))
+        self.nomenclature_tol_spin = QDoubleSpinBox()
+        self.nomenclature_tol_spin.setRange(0.001, 50.0)
+        self.nomenclature_tol_spin.setDecimals(3)
+        self.nomenclature_tol_spin.setSingleStep(0.01)
+        self.nomenclature_tol_spin.setValue(0.15)
+        self.nomenclature_tol_spin.setFixedWidth(80)
+        spectra_layout.addWidget(self.nomenclature_tol_spin)
+        spectra_layout.addStretch()
+
+        show_spectra_btn = QPushButton("Show on Spectra")
+        show_spectra_btn.clicked.connect(self._on_show_nomenclature_on_spectra)
+        spectra_layout.addWidget(show_spectra_btn)
+
+        clear_spectra_btn = QPushButton("Clear")
+        clear_spectra_btn.clicked.connect(
+            lambda: self.show_annotated_on_spectra.emit([], 0.0)
+        )
+        spectra_layout.addWidget(clear_spectra_btn)
+        layout.addWidget(spectra_grp)
+
+        note = QLabel(
+            "Successfully annotated peaks (non-blank glycan name) are highlighted "
+            "in green on the Spectrum panel, within the chosen tolerance window."
+        )
+        note.setStyleSheet(f"color: {PALETTE['text_dim']}; font-size: 9px;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        layout.addStretch()
+        return w
+
+    def _populate_nomenclature_table(self):
+        self.nomenclature_table.setRowCount(len(self.peaks))
+        for row, pk in enumerate(self.peaks):
+            mz_item = QTableWidgetItem(f"{pk:.4f}")
+            mz_item.setFlags(mz_item.flags() & ~Qt.ItemIsEditable)
+            self.nomenclature_table.setItem(row, 0, mz_item)
+
+            name = self.nomenclature_labels.get(pk, "")
+            name_item = QTableWidgetItem(name)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.nomenclature_table.setItem(row, 1, name_item)
+
+            theo = self.peak_theoretical_mz.get(pk)
+            if theo is not None:
+                delta = theo - pk          # theoretical − observed
+                sign = "+" if delta >= 0 else ""
+                delta_text = f"{sign}{delta:.4f}"
+                abs_d = abs(delta)
+                if abs_d < 0.05:
+                    colour = PALETTE["success"]
+                elif abs_d < 0.15:
+                    colour = PALETTE["accent2"]
+                else:
+                    colour = PALETTE["peak_marker"]
+            else:
+                delta_text = "—"
+                colour = PALETTE["text_dim"]
+
+            delta_item = QTableWidgetItem(delta_text)
+            delta_item.setFlags(delta_item.flags() & ~Qt.ItemIsEditable)
+            delta_item.setForeground(QColor(colour))
+            self.nomenclature_table.setItem(row, 2, delta_item)
+
+    def _on_toggle_edit_names(self, checked: bool):
+        for row in range(self.nomenclature_table.rowCount()):
+            item = self.nomenclature_table.item(row, 1)
+            if item is None:
+                continue
+            if checked:
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
+            else:
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        self.edit_names_btn.setText(
+            "Editing… (click to lock)" if checked else "Edit Names"
+        )
+
+    def _on_save_nomenclature(self):
+        updated: dict[float, str] = {}
+        for row, pk in enumerate(self.peaks):
+            item = self.nomenclature_table.item(row, 1)
+            updated[pk] = item.text().strip() if item is not None else ""
+
+        self.nomenclature_labels = updated
+
+        # Keep the rest of the sidebar (Glycan dropdown, UMAP, etc.) in sync
+        for pk, name in updated.items():
+            if name:
+                self.mz_to_label[pk] = name
+                self.label_to_mz[name] = pk
+
+        new_names = []
+        for pk in self.peaks:
+            name = updated.get(pk, "")
+            new_names.append(f"{name}  ({pk:.2f})" if name else f"{pk:.4f}")
+        self.glycan_names = new_names
+        self._refresh_glycan_name_combos()
+        self._build_theoretical_mz_lookup()
+        # If a glycan_df was supplied at launch, keep it in sync for this session
+        if self.glycan_df is not None and "mz" in self.glycan_df.columns:
+            for pk, name in updated.items():
+                if not name:
+                    continue
+                mask = (self.glycan_df["mz"].astype(float) - pk).abs() < 1e-6
+                if mask.any():
+                    self.glycan_df.loc[mask, "label"] = name
+
+        self.edit_names_btn.setChecked(False)
+        self.nomenclature_updated.emit({k: v for k, v in updated.items() if v})
+        show_info("Glycan names saved.")
+
+    def _refresh_glycan_name_combos(self):
+        for combo in (getattr(self, "glycan_search", None),
+                      getattr(self, "umap_glycan_combo", None)):
+            if combo is None:
+                continue
+            current = combo.currentIndex()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(self.glycan_names)
+            if 0 <= current < combo.count():
+                combo.setCurrentIndex(current)
+            combo.blockSignals(False)
+
+    def _on_show_nomenclature_on_spectra(self):
+        tol = self.nomenclature_tol_spin.value()
+        theoretical_mzs = []
+        unmatched = 0
+
+        for pk in self.peaks:
+            name = self.nomenclature_labels.get(pk, "")
+            if not name:
+                continue
+            theo = self.peak_theoretical_mz.get(pk)
+            if theo is not None:
+                theoretical_mzs.append(theo)
+            else:
+                unmatched += 1
+
+        if not theoretical_mzs:
+            show_info(
+                "No annotated glycans matched a theoretical mass in "
+                "glycan_list.csv — nothing to show."
+            )
+            return
+
+        if unmatched:
+            show_info(
+                f"{unmatched} annotated glycan(s) had no match in "
+                "glycan_list.csv and were skipped."
+            )
+
+        self.show_annotated_on_spectra.emit(theoretical_mzs, tol)
+
+
 
     def _open_glycan_selection(self):
         dlg = GlycanSelectionDialog(
@@ -3798,6 +4125,9 @@ def launch_goatpy_gui(
     sidebar.glycan_selected.connect(
         lambda mz, lbl: spectrum_widget.highlight_glycan(mz, lbl)
     )
+    sidebar.show_annotated_on_spectra.connect(spectrum_widget.set_annotated_highlights)
+    sidebar.nomenclature_updated.connect(spectrum_widget.update_peak_labels)
+
     spectrum_widget.peak_clicked.connect(sidebar.select_peak_from_spectrum)
     spectrum_widget.unregistered_peak_display.connect(sidebar.display_unregistered_ion_image)
 
