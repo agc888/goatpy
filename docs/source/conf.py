@@ -46,25 +46,30 @@ intersphinx_mapping = {
 templates_path = ['_templates']
 exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 
-html_theme = 'sphinx_rtd_theme'
+html_theme = 'pydata_sphinx_theme'
 html_theme_options = {
-    'navigation_depth': 4,
-    "logo_only": True,
-    'collapse_navigation': False,
-    'sticky_navigation': True,
-    'includehidden': True,
+    "github_url": "https://github.com/agc888/goatpy",
+    "logo": {
+        "image_light": "_static/logo.png",
+        "image_dark": "_static/logo.png",  # swap in a light-colored version if you have one
+    },
+    "navbar_start": ["navbar-logo"],
+    "navbar_end": ["navbar-icon-links"],
+    "navbar_align": "left",
+    "show_toc_level": 2,
+    "collapse_navigation": False,
+    "use_edit_page_button": True,
+    "back_to_top_button": True,
 }
 
 html_context = {
-    "display_github": True,
     "github_user": "agc888",
     "github_repo": "goatpy",
     "github_version": "main",
-    "conf_py_path": "/docs/source/",
+    "doc_path": "docs/source",   # note: pydata wants doc_path without leading/trailing slashes
 }
 
 html_static_path = ['_static']
-html_logo = "_static/logo.png"
 html_show_sourcelink = True
 
 source_suffix = {
