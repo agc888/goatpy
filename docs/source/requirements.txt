@@ -1,5 +1,5 @@
 sphinx>=7.0
-pydata-sphinx-theme>=0.15
+sphinx-book-theme>=1.1
 sphinx-design>=0.5
 sphinx-copybutton>=0.5
 sphinx-autoapi>=3.0

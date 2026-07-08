@@ -16,7 +16,9 @@ extensions = [
     'sphinx.ext.intersphinx',
     'myst_parser',
     'autoapi.extension',
-    'nbsphinx'
+    'nbsphinx',
+    "sphinx_design",
+    "sphinx_copybutton",
 ]
 
 autoapi_dirs = ['../../goatpy']
@@ -46,20 +48,24 @@ intersphinx_mapping = {
 templates_path = ['_templates']
 exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 
-html_theme = 'pydata_sphinx_theme'
+html_theme = "sphinx_book_theme"
+
 html_theme_options = {
-    "github_url": "https://github.com/agc888/goatpy",
+    "repository_url": "https://github.com/agc888/goatpy",
+    "repository_branch": "main",
+    "path_to_docs": "docs/source",
+    "use_repository_button": True,
+    "use_issues_button": True,
+    "use_edit_page_button": True,
+    "use_download_button": True,
+    "use_fullscreen_button": True,
+    "home_page_in_toc": True,
+    "show_navbar_depth": 2,
+    "toc_title": "Contents",
     "logo": {
         "image_light": "_static/logo.png",
-        "image_dark": "_static/logo.png",  # swap in a light-colored version if you have one
+        "image_dark": "_static/logo.png",
     },
-    "navbar_start": ["navbar-logo"],
-    "navbar_end": ["navbar-icon-links"],
-    "navbar_align": "left",
-    "show_toc_level": 2,
-    "collapse_navigation": False,
-    "use_edit_page_button": True,
-    "back_to_top_button": True,
 }
 
 html_context = {
