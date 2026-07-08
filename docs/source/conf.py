@@ -62,6 +62,7 @@ html_theme_options = {
     "home_page_in_toc": True,
     "show_navbar_depth": 2,
     "toc_title": "Contents",
+    "navbar_end": ["theme-switcher"],
     "logo": {
         "image_light": "_static/logo.png",
         "image_dark": "_static/logo.png",
