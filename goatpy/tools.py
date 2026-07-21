@@ -7,6 +7,25 @@ from spatialdata import SpatialData
 from collections import defaultdict
 from anndata import AnnData
 
+import numpy as np
+import pandas as pd
+import pkg_resources
+
+from pathlib import Path
+from spatialdata import SpatialData
+from collections import defaultdict
+from anndata import AnnData
+
+
+import numpy as np
+import pandas as pd
+import pkg_resources
+
+from pathlib import Path
+from spatialdata import SpatialData
+from collections import defaultdict
+from anndata import AnnData
+
 
 def annotate_glycans(
     sdata,
@@ -52,8 +71,8 @@ def annotate_glycans(
                 f"{glycan_list} must contain exactly "
                 f"2 columns, found {glycans.shape[1]}"
             )
-        
-    # --- NEW: any columns beyond mz + Composition get carried through as annotation metadata ---
+
+    # --- any columns beyond mz + Composition get carried through as annotation metadata ---
     extra_cols = list(glycans.columns[2:])
     extra_data = {col: [] for col in extra_cols}
 
@@ -63,7 +82,7 @@ def annotate_glycans(
             mz = str(mz)[3:]
 
         gly_name = []
-        # --- NEW: track matched row indices so we can pull the extra columns too ---
+        # --- track matched row indices so we can pull the extra columns too ---
         matched_idx = []
 
         mz_float = np.float64(mz)
@@ -80,7 +99,7 @@ def annotate_glycans(
                 gly_name.append(
                     np.array(glycans.iloc[:, 1])[idx]
                 )
-                matched_idx.append(idx)  # NEW
+                matched_idx.append(idx)
 
         # Multiple annotations
         if len(gly_name) > 1:
@@ -94,10 +113,10 @@ def annotate_glycans(
         else:
             names.append(gly_name[0])
 
-        # --- NEW: fill in the extra columns for this mz, mirroring the name logic above ---
+        # --- fill in the extra columns for this mz, mirroring the name logic above ---
         for col in extra_cols:
             if len(matched_idx) == 0:
-                extra_data[col].append(pd.NA)
+                extra_data[col].append(np.nan)
             elif len(matched_idx) == 1:
                 extra_data[col].append(glycans.iloc[matched_idx[0]][col])
             else:
@@ -106,9 +125,17 @@ def annotate_glycans(
 
     adata.var_names = names
 
-    # --- NEW: attach the annotation metadata columns to var ---
+    # --- attach the annotation metadata columns to var as categoricals ---
+    # (categorical dtype safely handles NaN alongside strings when writing
+    # to zarr; a plain object column mixing str + float NaN breaks the
+    # string codec used by spatialdata's writer)
     for col in extra_cols:
-        adata.var[col] = extra_data[col]
+        ser = pd.Series(extra_data[col], index=adata.var_names)
+        # Force categories to be plain strings (not int/float) so the
+        # zarr string codec can serialize them; keep real NaNs as
+        # missing rather than the literal string "nan".
+        ser = ser.where(ser.isna(), ser.astype(str))
+        adata.var[col] = ser.astype("category")
 
     # Statistics
     var_names = list(adata.var_names)
@@ -235,7 +262,7 @@ def annotate_glycans(
             var["glycans"] = adata.var_names.astype(str)
             var["mz_original"] = var["mz_original"].astype(str)
 
-            # --- NEW: aggregate the extra annotation columns alongside mz_original/duplicates ---
+            # --- aggregate the extra annotation columns alongside mz_original/duplicates ---
             agg_dict = {
                 "mz_original": ("mz_original", "first"),
                 "duplicates": ("mz_original", lambda x: ",".join(x)),
@@ -260,6 +287,14 @@ def annotate_glycans(
             # Make sure metadata order matches expression matrix
             var_combined = var_combined.loc[df_combined.columns]
 
+            # --- re-cast extra columns to category after aggregation, since
+            # groupby("first") can silently return an object dtype even
+            # when the source column was categorical ---
+            for col in extra_cols:
+                ser = var_combined[col]
+                ser = ser.where(ser.isna(), ser.astype(str))
+                var_combined[col] = ser.astype("category")
+
             # Replace matrix and metadata
             adata.X = df_combined.values
             adata.var = var_combined
@@ -283,13 +318,12 @@ def annotate_glycans(
         adata.var["glycans"] = adata.var_names
 
     if "duplicates" in adata.var.columns:
-        # --- NEW: keep the extra annotation columns in the final var, not just mz_original/glycans/duplicates ---
+        # --- keep the extra annotation columns in the final var, not just mz_original/glycans/duplicates ---
         adata.var = adata.var[["mz_original", "glycans", "duplicates"] + extra_cols]
 
     sdata[adata_slot] = adata
 
     return sdata
-
 
 def merge_spatialdata(
     sdatas: list,

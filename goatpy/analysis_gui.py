@@ -286,7 +286,7 @@ def _load_glycan_reference_table() -> pd.DataFrame:
         return pd.DataFrame(columns=["mz", "label"])
 
     df = df.rename(columns={
-        "Theoretical m/z [M+Na]": "mz",
+        "Theoretical_m/z": "mz",
         "Composition": "label",
     })
     df["mz"] = pd.to_numeric(df["mz"], errors="coerce")
