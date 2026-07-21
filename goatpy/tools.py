@@ -28,7 +28,7 @@ def annotate_glycans(
 
     if glycan_list is None:
 
-        path = pkg_resources.resource_filename('goatpy', 'data/glycan_list.csv')
+        path = pkg_resources.resource_filename('goatpy', 'data/goatpy_MALDI_Glycan_Library_AED_Jul2026.csv')
         glycans = pd.read_csv(path)
 
     else:
@@ -52,13 +52,19 @@ def annotate_glycans(
                 f"{glycan_list} must contain exactly "
                 f"2 columns, found {glycans.shape[1]}"
             )
+        
+    # --- NEW: any columns beyond mz + Composition get carried through as annotation metadata ---
+    extra_cols = list(glycans.columns[2:])
+    extra_data = {col: [] for col in extra_cols}
 
     for mz in original_mz:
 
         if str(mz).startswith("mz-"):
             mz = str(mz)[3:]
-    
+
         gly_name = []
+        # --- NEW: track matched row indices so we can pull the extra columns too ---
+        matched_idx = []
 
         mz_float = np.float64(mz)
 
@@ -74,6 +80,7 @@ def annotate_glycans(
                 gly_name.append(
                     np.array(glycans.iloc[:, 1])[idx]
                 )
+                matched_idx.append(idx)  # NEW
 
         # Multiple annotations
         if len(gly_name) > 1:
@@ -87,8 +94,21 @@ def annotate_glycans(
         else:
             names.append(gly_name[0])
 
+        # --- NEW: fill in the extra columns for this mz, mirroring the name logic above ---
+        for col in extra_cols:
+            if len(matched_idx) == 0:
+                extra_data[col].append(pd.NA)
+            elif len(matched_idx) == 1:
+                extra_data[col].append(glycans.iloc[matched_idx[0]][col])
+            else:
+                values = [str(glycans.iloc[i][col]) for i in matched_idx]
+                extra_data[col].append(", ".join(values))
+
     adata.var_names = names
 
+    # --- NEW: attach the annotation metadata columns to var ---
+    for col in extra_cols:
+        adata.var[col] = extra_data[col]
 
     # Statistics
     var_names = list(adata.var_names)
@@ -189,7 +209,7 @@ def annotate_glycans(
 
 
     if duplicated.any():
-        
+
         if duplicate_glycans == "combine":
 
             X = adata.X
@@ -215,13 +235,18 @@ def annotate_glycans(
             var["glycans"] = adata.var_names.astype(str)
             var["mz_original"] = var["mz_original"].astype(str)
 
+            # --- NEW: aggregate the extra annotation columns alongside mz_original/duplicates ---
+            agg_dict = {
+                "mz_original": ("mz_original", "first"),
+                "duplicates": ("mz_original", lambda x: ",".join(x)),
+            }
+            for col in extra_cols:
+                agg_dict[col] = (col, "first")
+
             var_combined = (
                 var
                 .groupby("glycans", sort=False)
-                .agg(
-                    mz_original=("mz_original", "first"),
-                    duplicates=("mz_original", lambda x: ",".join(x))
-                )
+                .agg(**agg_dict)
             )
 
             var_combined.index.name = None
@@ -256,9 +281,10 @@ def annotate_glycans(
 
     if "glycans" not in adata.var.columns:
         adata.var["glycans"] = adata.var_names
-    
+
     if "duplicates" in adata.var.columns:
-        adata.var = adata.var[["mz_original", "glycans", "duplicates"]]
+        # --- NEW: keep the extra annotation columns in the final var, not just mz_original/glycans/duplicates ---
+        adata.var = adata.var[["mz_original", "glycans", "duplicates"] + extra_cols]
 
     sdata[adata_slot] = adata
 

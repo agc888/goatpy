@@ -254,7 +254,7 @@ def _resolve_mz_array(adata) -> np.ndarray:
 def _load_glycan_reference_table() -> pd.DataFrame:
     """
     Load the curated theoretical-mass reference table bundled with goatpy
-    (goatpy/data/glycan_list.csv). Columns are normalised to 'mz' (theoretical
+    (goatpy/data/goatpy_MALDI_Glycan_Library_AED_Jul2026.csv). Columns are normalised to 'mz' (theoretical
     m/z [M+Na]) and 'label' (composition / glycan name).
     """
     df = None
@@ -262,7 +262,7 @@ def _load_glycan_reference_table() -> pd.DataFrame:
     # Preferred: package data access (works when goatpy is installed)
     try:
         from importlib.resources import files
-        path = files("goatpy").joinpath("data", "glycan_list.csv")
+        path = files("goatpy").joinpath("data", "goatpy_MALDI_Glycan_Library_AED_Jul2026.csv")
         df = pd.read_csv(path)
     except Exception:
         df = None
@@ -273,7 +273,7 @@ def _load_glycan_reference_table() -> pd.DataFrame:
             import pathlib
             here = pathlib.Path(__file__).resolve()
             for parent in here.parents:
-                candidate = parent / "data" / "glycan_list.csv"
+                candidate = parent / "data" / "goatpy_MALDI_Glycan_Library_AED_Jul2026.csv"
                 if candidate.exists():
                     df = pd.read_csv(candidate)
                     break
@@ -281,7 +281,7 @@ def _load_glycan_reference_table() -> pd.DataFrame:
             df = None
 
     if df is None:
-        print("[goatpy GUI] Could not locate glycan_list.csv — "
+        print("[goatpy GUI] Could not locate goatpy_MALDI_Glycan_Library_AED_Jul2026.csv — "
               "theoretical-mass lookup will be unavailable.")
         return pd.DataFrame(columns=["mz", "label"])
 
@@ -2750,14 +2750,14 @@ class AnalysisSidebar(QWidget):
         if not theoretical_mzs:
             show_info(
                 "No annotated glycans matched a theoretical mass in "
-                "glycan_list.csv — nothing to show."
+                "goatpy_MALDI_Glycan_Library_AED_Jul2026.csv — nothing to show."
             )
             return
 
         if unmatched:
             show_info(
                 f"{unmatched} annotated glycan(s) had no match in "
-                "glycan_list.csv and were skipped."
+                "goatpy_MALDI_Glycan_Library_AED_Jul2026.csv and were skipped."
             )
 
         self.show_annotated_on_spectra.emit(theoretical_mzs, tol)
