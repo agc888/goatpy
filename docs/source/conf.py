@@ -14,9 +14,7 @@ extensions = [
     'sphinx.ext.napoleon',
     'sphinx.ext.viewcode',
     'sphinx.ext.intersphinx',
-    'myst_parser',
     'autoapi.extension',
-    'nbsphinx',
     "sphinx_design",
     "sphinx_copybutton",
     "sphinx_togglebutton",
@@ -83,7 +81,8 @@ html_show_sourcelink = True
 
 source_suffix = {
     '.rst': 'restructuredtext',
-    '.md': 'markdown',
+    '.ipynb': 'myst-nb',
+    '.md': 'myst-nb',
 }
 
-nbsphinx_execute = 'never'
+nb_execution_mode = 'off'
