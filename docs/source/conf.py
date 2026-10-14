@@ -77,7 +77,6 @@ html_context = {
 }
 
 html_static_path = ['_static']
-html_js_files = ['hide_cells.js']
 html_show_sourcelink = True
 
 source_suffix = {
