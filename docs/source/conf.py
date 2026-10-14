@@ -2,6 +2,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.abspath('../..'))
+sys.path.insert(0, os.path.abspath('_ext'))
 
 project = 'goatpy'
 copyright = '2025, Andrew Causer'
@@ -20,6 +21,7 @@ extensions = [
     "sphinx_design",
     "sphinx_copybutton",
     "sphinx_togglebutton",
+    "collapse_code",
 ]
 
 autoapi_dirs = ['../../goatpy']
