@@ -11,12 +11,13 @@ from .preprocessing import normalize_spatialdata
 from .he_image import he_spatialdata, add_annotations
 from .annotation import annotations_to_pixels
 from .filter import filter_spatialdata
-from .tools import annotate_glycans, merge_spatialdata
+from .tools import annotate_glycans, merge_spatialdata,spatial_autocorrelation
 from .bin import bin_and_align, bin_imzml
 from .plotting import check_batch, plot_spectrum, plot_spectra_comparison
 from .batch_correction import batch_correction
 from .analysis_gui import launch_goatpy_gui 
-from .sopa_segmentation import prep_pixel_segmentation
+from .sopa_segmentation import prep_pixel_segmentation, add_n_cells_per_pixel
+from .calibration import calibrate_imzml_file
 
 __all__ = [
     "Add_Pseudo_Image",
@@ -42,7 +43,10 @@ __all__ = [
     "ihc_spatialdata",
     "annotations_to_pixels",
     "launch_goatpy_gui",
-    "prep_pixel_segmentation"
+    "prep_pixel_segmentation",
+    "spatial_autocorrelation",
+    "add_n_cells_per_pixel",
+    "calibrate_imzml_file"
 ]
 
 __version__ = "0.1.0"

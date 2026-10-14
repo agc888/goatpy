@@ -19,6 +19,7 @@ extensions = [
     'nbsphinx',
     "sphinx_design",
     "sphinx_copybutton",
+    "sphinx_togglebutton",
 ]
 
 autoapi_dirs = ['../../goatpy']

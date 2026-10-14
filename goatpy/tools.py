@@ -27,6 +27,10 @@ from collections import defaultdict
 from anndata import AnnData
 
 
+import scipy.sparse as sp_sparse
+from sklearn.neighbors import NearestNeighbors
+
+
 def annotate_glycans(
     sdata,
     glycan_list=None,
@@ -733,3 +737,73 @@ def _is_float(v: str) -> bool:
         return True
     except (ValueError, TypeError):
         return False
+    
+
+
+
+
+
+def _build_spatial_weights(coords, n_neighbors=6):
+    n = coords.shape[0]
+    nn = NearestNeighbors(n_neighbors=n_neighbors + 1).fit(coords)
+    _, idx = nn.kneighbors(coords)
+    idx = idx[:, 1:]
+    rows = np.repeat(np.arange(n), n_neighbors)
+    W = sp_sparse.coo_matrix(
+        (np.ones(rows.size), (rows, idx.flatten())), shape=(n, n)
+    ).tocsr()
+    return W.maximum(W.T)  # symmetrize
+
+def _get_gt_vector(adata, gt):
+    if isinstance(gt, tuple):
+        col, value = gt
+        return (adata.obs[col].astype(str) == str(value)).astype(float).to_numpy()
+    if gt in adata.var_names:
+        x = adata[:, gt].X
+        return np.asarray(x.todense()).flatten() if sp_sparse.issparse(x) else np.asarray(x).flatten()
+    if gt in adata.obs.columns:
+        col = adata.obs[gt]
+        if pd.api.types.is_numeric_dtype(col):
+            return col.to_numpy(dtype=float)
+        raise ValueError(f"'{gt}' is categorical — pass as ('{gt}', '<label>') instead")
+    raise KeyError(f"'{gt}' not found in var_names or obs.columns")
+
+def spatial_autocorrelation(
+    sdata,
+    gt,
+    table_key: str = "maldi_adata",
+    pixels_key: str = "pixels",
+    coordinate_system: str = "aligned",
+    n_neighbors: int = 6,
+    top_n: int = 20,
+):
+    adata = sdata.tables[table_key]
+    pixels = sd.transform(sdata.shapes[pixels_key], to_coordinate_system=coordinate_system)
+    instance_key = adata.uns[TableModel.ATTRS_KEY]["instance_key"]
+    cent = pixels.geometry.centroid.reindex(adata.obs[instance_key])
+    coords = np.column_stack([cent.x.to_numpy(), cent.y.to_numpy()])
+
+    W = _build_spatial_weights(coords, n_neighbors=n_neighbors)
+    S0, n = W.sum(), W.shape[0]
+
+    gt_vec = _get_gt_vector(adata, gt)
+    gt_z = (gt_vec - gt_vec.mean()) / gt_vec.std()
+
+    X = adata.X
+    X = X.toarray() if sp_sparse.issparse(X) else np.asarray(X)
+    Xz = (X.astype(float) - X.mean(axis=0)) / X.std(axis=0)
+
+    WXz = W @ Xz
+    bivariate_moran = (n / S0) * (gt_z @ WXz) / (np.linalg.norm(gt_z) * np.linalg.norm(Xz, axis=0))
+    pearson_r = (gt_z @ Xz) / (n - 1)
+
+    result = pd.DataFrame({
+        "mz": adata.var_names,
+        "bivariate_moran_I": bivariate_moran,
+        "pearson_r": pearson_r,
+    })
+    if isinstance(gt, str) and gt in adata.var_names:
+        result = result[result["mz"] != gt]
+
+    result["abs_I"] = result["bivariate_moran_I"].abs()
+    return result.sort_values("abs_I", ascending=False).drop(columns="abs_I").head(top_n).reset_index(drop=True)
