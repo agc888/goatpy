@@ -14,11 +14,11 @@ extensions = [
     'sphinx.ext.napoleon',
     'sphinx.ext.viewcode',
     'sphinx.ext.intersphinx',
+    'myst_parser',
     'autoapi.extension',
+    'nbsphinx',
     "sphinx_design",
     "sphinx_copybutton",
-    "sphinx_togglebutton",
-    "myst_nb",
 ]
 
 autoapi_dirs = ['../../goatpy']
@@ -81,8 +81,7 @@ html_show_sourcelink = True
 
 source_suffix = {
     '.rst': 'restructuredtext',
-    '.ipynb': 'myst-nb',
-    '.md': 'myst-nb',
+    '.md': 'markdown',
 }
 
-nb_execution_mode = 'off'
+nbsphinx_execute = 'never'
