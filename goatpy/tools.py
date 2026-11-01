@@ -4,31 +4,13 @@ import pkg_resources
 
 from pathlib import Path
 from spatialdata import SpatialData
+import spatialdata as sd
 from collections import defaultdict
 from anndata import AnnData
-
-import numpy as np
-import pandas as pd
-import pkg_resources
-
-from pathlib import Path
-from spatialdata import SpatialData
-from collections import defaultdict
-from anndata import AnnData
-
-
-import numpy as np
-import pandas as pd
-import pkg_resources
-
-from pathlib import Path
-from spatialdata import SpatialData
-from collections import defaultdict
-from anndata import AnnData
-
 
 import scipy.sparse as sp_sparse
 from sklearn.neighbors import NearestNeighbors
+from spatialdata.models import TableModel
 
 
 def annotate_glycans(

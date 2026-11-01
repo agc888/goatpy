@@ -9,9 +9,10 @@ from spatialdata.transformations import get_transformation
 from spatialdata.models import ShapesModel, TableModel
 
 
-def prep_pixel_segmentation(sdata, image_key="he_image", coordinate_system="aligned", roi_key="pixels"):
+def make_gp_image_patches(sdata, image_key="he_image", coordinate_system="aligned", roi_key="pixels",patch_width=2000, patch_overlap=50, key_added=None):
     """
-    Get the 'pixels' shapes in the raw pixel space of the given image.
+    Generates image patches for the given image based on the specified coordinate system (i.e. aligned). 
+    Based on sopa.make_image_patches, but uses a goatpy generated coordinate system to map the pixels to image patched
     """
     
     # the affine that maps he_image's raw pixel space -> 'aligned'
@@ -32,7 +33,7 @@ def prep_pixel_segmentation(sdata, image_key="he_image", coordinate_system="alig
     # gets an Identity transform by default -> matches he_image's own raw ('global') space
     sdata.shapes["in_maldi_pixels"] = ShapesModel.parse(pixels_raw)
 
-    sopa.make_image_patches(sdata,patch_width=2000,patch_overlap=50,roi_key="in_maldi_pixels",image_key="he_image")
+    sopa.make_image_patches(sdata,patch_width=patch_width,patch_overlap=patch_overlap,roi_key="in_maldi_pixels",image_key=image_key,key_added=key_added)
 
     del sdata.shapes["in_maldi_pixels"]    
     

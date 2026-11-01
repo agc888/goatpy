@@ -16,7 +16,7 @@ from .bin import bin_and_align, bin_imzml
 from .plotting import check_batch, plot_spectrum, plot_spectra_comparison
 from .batch_correction import batch_correction
 from .analysis_gui import launch_goatpy_gui 
-from .sopa_segmentation import prep_pixel_segmentation, add_n_cells_per_pixel
+from .sopa_segmentation import make_gp_image_patches, add_n_cells_per_pixel
 from .calibration import calibrate_imzml_file
 
 __all__ = [
@@ -43,7 +43,7 @@ __all__ = [
     "ihc_spatialdata",
     "annotations_to_pixels",
     "launch_goatpy_gui",
-    "prep_pixel_segmentation",
+    "make_gp_image_patches",
     "spatial_autocorrelation",
     "add_n_cells_per_pixel",
     "calibrate_imzml_file"

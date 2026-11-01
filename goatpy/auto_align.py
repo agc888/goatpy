@@ -20,6 +20,13 @@ Key design decisions
     This guarantees that best_idx, canvas pixels, and annotation coordinates
     all live in the same coordinate system.
 
+5.  The search canvas and the output canvas are built with identical
+    parameters (including the min_w / min_h template-size minimums), so
+    best_idx is always valid for the output canvas.
+
+6.  The output canvas is cropped to the union of the warped reference image
+    and the MALDI rectangle, removing wasted black padding.
+
 IHC support
 -----------
 When ``ihc_path`` is supplied to ``load_and_align``, the function loads a
@@ -42,6 +49,9 @@ All three steps share the same affine matrix M_stored:
 
 Because the same matrix is used everywhere, best_idx from matchTemplate is
 directly valid as the MALDI placement offset in the output canvas.
+
+When the canvas is cropped, M_stored, best_idx and the canvas placement are
+all shifted by the same (x0, y0) so this invariant is preserved.
 """
 
 from __future__ import annotations
@@ -477,6 +487,8 @@ def _build_ihc_canvas(
     src_h: int,
     rotation_deg: float,
     buffer_px: int,
+    min_w: int = 0,
+    min_h: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
     """
     Build the IHC output canvas by applying the same affine transform used
@@ -490,6 +502,8 @@ def _build_ihc_canvas(
     src_w, src_h : dimensions of the registration-resolution IHC image
     rotation_deg : best rotation from _register()
     buffer_px    : canvas padding, must match value used in _register()
+    min_w, min_h : minimum canvas size, must match the values used in
+                   _register() (the MALDI template size)
 
     Returns
     -------
@@ -499,7 +513,7 @@ def _build_ihc_canvas(
     canvas_pc   : int — col placement offset
     """
     M_stored, canvas_w, canvas_h, canvas_pc, canvas_pr = _build_affine_matrix(
-        src_w, src_h, rotation_deg, buffer_px
+        src_w, src_h, rotation_deg, buffer_px, min_w=min_w, min_h=min_h
     )
 
     M_cv = M_stored[:2, :]
@@ -740,6 +754,101 @@ def _register(
 
 
 # ---------------------------------------------------------------------------
+# Scale search
+# ---------------------------------------------------------------------------
+
+def _resize_gray(gray: np.ndarray, s: float) -> np.ndarray:
+    """Resize a 2-D float32 image by factor ``s`` (same rounding as the image resize)."""
+    if abs(s - 1.0) < 1e-9:
+        return gray
+    h, w = gray.shape
+    nw = max(1, round(w * s))
+    nh = max(1, round(h * s))
+    interp = cv.INTER_AREA if s < 1.0 else cv.INTER_LINEAR
+    return cv.resize(gray, (nw, nh), interpolation=interp)
+
+
+def _search_scale(ref_gray, maldi_gray, rotation, scales, buffer_px):
+    """Evaluate matchTemplate at a fixed rotation over a list of scale factors."""
+    best_score, best_s, best_idx = -np.inf, 1.0, (0, 0)
+    for sc in scales:
+        g = _resize_gray(ref_gray, float(sc))
+        score, idx = _match_at_rotation(g, maldi_gray, rotation, buffer_px)
+        _log(f"    scale={sc:.4f}  score={score:.4f}")
+        if score > best_score:
+            best_score, best_s, best_idx = score, float(sc), idx
+    return best_score, best_s, best_idx
+
+
+def _refine_rotation(ref_gray, maldi_gray, rotation, score, idx,
+                     fine_range, fine_step, buffer_px):
+    """Local rotation search around ``rotation`` on an (already scaled) image."""
+    best_rot, best_score, best_idx = rotation, score, idx
+    for d in np.arange(-fine_range, fine_range + fine_step / 2, fine_step):
+        if abs(d) < 1e-6:
+            continue
+        rot = round(rotation + float(d), 2)
+        sc, ix = _match_at_rotation(ref_gray, maldi_gray, rot, buffer_px)
+        _log(f"    rot={rot:6.2f}  score={sc:.4f}")
+        if sc > best_score:
+            best_score, best_rot, best_idx = sc, rot, ix
+    return best_rot, best_score, best_idx
+
+
+def _register_with_scale(
+    ref_gray: np.ndarray,
+    maldi_gray: np.ndarray,
+    src_w: int,
+    src_h: int,
+    coarse_step: int,
+    fine_range: float,
+    fine_step: float,
+    buffer_px: int,
+    scale_range: tuple[float, float] = (0.8, 1.6),
+    scale_step: float = 0.02,
+) -> tuple[float, tuple[int, int], float, float]:
+    """
+    Rotation search (as in _register) followed by a scale search, then
+    alternating refinement of rotation and scale.
+
+    Returns (rotation, (row, col), scale, score).  ``scale`` is the factor
+    the reference image must be enlarged by (>1 = enlarge) to match MALDI.
+    """
+    _log("  Step 1/4: rotation search at scale 1.0")
+    rot, idx = _register(
+        ref_gray, maldi_gray, src_w, src_h,
+        coarse_step=coarse_step, fine_range=fine_range, fine_step=fine_step,
+        buffer_px=buffer_px,
+    )
+
+    _log(f"  Step 2/4: coarse scale search at rotation {rot}")
+    lo, hi = scale_range
+    scales = np.arange(lo, hi + scale_step / 2, scale_step)
+    score, sc, idx = _search_scale(ref_gray, maldi_gray, rot, scales, buffer_px)
+    _log(f"  Best coarse scale: {sc:.3f}  score={score:.4f}")
+
+    _log("  Step 3/4: rotation refinement at best scale")
+    g = _resize_gray(ref_gray, sc)
+    rot, score, idx = _refine_rotation(
+        g, maldi_gray, rot, score, idx, fine_range, fine_step, buffer_px
+    )
+
+    _log("  Step 4/4: fine scale search")
+    fine_scales = np.arange(sc - scale_step, sc + scale_step + scale_step / 8,
+                            scale_step / 4)
+    f_score, f_sc, f_idx = _search_scale(ref_gray, maldi_gray, rot, fine_scales, buffer_px)
+    if f_score >= score:
+        score, sc, idx = f_score, f_sc, f_idx
+    g = _resize_gray(ref_gray, sc)
+    rot, score, idx = _refine_rotation(
+        g, maldi_gray, rot, score, idx, 2.0, 0.5, buffer_px
+    )
+
+    _log(f"  Final: rotation={rot}  scale={sc:.4f}  score={score:.4f}  offset={idx}")
+    return rot, idx, sc, score
+
+
+# ---------------------------------------------------------------------------
 # Build H&E output canvas
 # ---------------------------------------------------------------------------
 
@@ -749,9 +858,16 @@ def _build_affine_and_canvas(
     src_h: int,
     rotation_deg: float,
     buffer_px: int,
+    min_w: int = 0,
+    min_h: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """
+    Build the H&E output canvas.  ``min_w`` / ``min_h`` must equal the
+    values used during registration (the MALDI template size) so that the
+    output canvas matches the search canvas and best_idx stays valid.
+    """
     M_stored, canvas_w, canvas_h, canvas_pc, canvas_pr = _build_affine_matrix(
-        src_w, src_h, rotation_deg, buffer_px
+        src_w, src_h, rotation_deg, buffer_px, min_w=min_w, min_h=min_h
     )
 
     img_np = np.array(he_img, dtype=np.uint8)
@@ -768,6 +884,45 @@ def _build_affine_and_canvas(
          f"pr={canvas_pr}, pc={canvas_pc}  rotation={rotation_deg}")
 
     return canvas, M_stored, canvas_pr, canvas_pc
+
+
+# ---------------------------------------------------------------------------
+# Canvas cropping
+# ---------------------------------------------------------------------------
+
+def _union_crop(canvas_h: int,
+                canvas_w: int,
+                M_stored: np.ndarray,
+                src_w: int,
+                src_h: int,
+                maldi_off: tuple[int, int],
+                maldi_hw: tuple[int, int],
+                scale: float,
+                pad: int = 10) -> tuple[int, int, int, int]:
+    """
+    Bounding box (x0, y0, x1, y1) in canvas coordinates covering both the
+    warped reference image and the MALDI rectangle, plus ``pad`` pixels.
+
+    Parameters
+    ----------
+    maldi_off : (row, col) of the MALDI top-left corner in the canvas
+    maldi_hw  : (height, width) of the MALDI image in MALDI pixels
+    scale     : MALDI pixel size / registration mpp (reg-px per MALDI px)
+    """
+    corners = np.array([[0, 0, 1],
+                        [src_w, 0, 1],
+                        [src_w, src_h, 1],
+                        [0, src_h, 1]], dtype=np.float64).T
+    pts = (M_stored @ corners)[:2]                      # (2, 4): x, y
+    off_r, off_c = maldi_off
+    m_h, m_w = maldi_hw
+    xs = np.concatenate([pts[0], [off_c, off_c + m_w * scale]])
+    ys = np.concatenate([pts[1], [off_r, off_r + m_h * scale]])
+    x0 = max(0, int(np.floor(xs.min())) - pad)
+    y0 = max(0, int(np.floor(ys.min())) - pad)
+    x1 = min(canvas_w, int(np.ceil(xs.max())) + pad)
+    y1 = min(canvas_h, int(np.ceil(ys.max())) + pad)
+    return x0, y0, x1, y1
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +1144,11 @@ def load_and_align(
     ihc_pixel_um: Optional[float] = None,
     ihc_channel: Optional[int] = None,
     ihc_invert: bool = False,
+    # ---- scale parameters ----
+    auto_scale: bool = False,
+    scale_range: tuple[float, float] = (0.8, 1.6),
+    scale_step: float = 0.02,
+    ref_scale: float = 1.0,
 ) -> SpatialData:
     """
     Load a MALDI imzML dataset and an H&E or IHC image, auto-register them,
@@ -1023,6 +1183,12 @@ def load_and_align(
     fine_rotation_range : float
     fine_rotation_step : float
     buffer_px : int
+        Padding added around the rotated reference image in the search
+        canvas.  Should be large enough for the MALDI template to slide
+        partly off the reference (roughly >= max(maldi_h, maldi_w)) when
+        the reference does not fully cover the MALDI acquisition area.
+        The output canvas is cropped to the union of reference + MALDI,
+        so a generous buffer costs no extra output memory.
     img_upscaling : int
     tol : float
     reduce_func : callable
@@ -1045,6 +1211,22 @@ def load_and_align(
         inversion, matching the bright MALDI TIC signal).
         For brightfield IHC, set ``ihc_invert=True``.
         For fluorescence IHC, leave as False (tissue is already bright).
+
+    Scale parameters
+    ----------------
+    auto_scale : bool, default False
+        Search for the scale factor that best matches the reference image to
+        the MALDI image (use when the images do not align in size, i.e. when
+        the pixel sizes are wrong or unknown).  The factor found is the amount
+        the reference image is enlarged by (>1 = enlarge); it is logged and
+        stored in ``he_transform["ref_scale"]``.
+    scale_range : (float, float)
+        Range of scale factors searched when ``auto_scale`` is True.
+    scale_step : float
+        Coarse step of the scale search (a finer pass follows).
+    ref_scale : float, default 1.0
+        Manual scale factor applied to the reference image when ``auto_scale``
+        is False.  Ignored when ``auto_scale`` is True.
 
     Returns
     -------
@@ -1209,6 +1391,9 @@ def load_and_align(
     _log("Preparing MALDI template ...")
     maldi_tic  = spectra_all.sum(axis=-1).astype(np.float32)
     maldi_gray = _maldi_to_grayscale(maldi_tic)
+    # Template size: the search canvas is forced to be at least this big, so
+    # the output canvas must be built with the same minimums.
+    tmpl_h, tmpl_w = maldi_gray.shape
     del maldi_tic
     gc.collect()
 
@@ -1246,15 +1431,53 @@ def load_and_align(
     # 7. Registration
     # ------------------------------------------------------------------
     _log("Running registration ...")
-    best_rot, best_idx = _register(
-        ref_gray, maldi_gray,
-        src_w=ref_reg_w,
-        src_h=ref_reg_h,
-        coarse_step=coarse_rotation_step,
-        fine_range=fine_rotation_range,
-        fine_step=fine_rotation_step,
-        buffer_px=buffer_px,
-    )
+    scale_total = 1.0
+    if auto_scale:
+        _log(f"  Auto-scale: searching {scale_range[0]:.2f}-{scale_range[1]:.2f} "
+             f"(step {scale_step})")
+        best_rot, best_idx, scale_total, _ = _register_with_scale(
+            ref_gray, maldi_gray,
+            src_w=ref_reg_w,
+            src_h=ref_reg_h,
+            coarse_step=coarse_rotation_step,
+            fine_range=fine_rotation_range,
+            fine_step=fine_rotation_step,
+            buffer_px=buffer_px,
+            scale_range=scale_range,
+            scale_step=scale_step,
+        )
+        ref_gray = _resize_gray(ref_gray, scale_total)
+    else:
+        if ref_scale != 1.0:
+            scale_total = float(ref_scale)
+            ref_gray = _resize_gray(ref_gray, scale_total)
+            _log(f"  Manual ref_scale={scale_total:.4f} applied to reference")
+        best_rot, best_idx = _register(
+            ref_gray, maldi_gray,
+            src_w=ref_gray.shape[1],
+            src_h=ref_gray.shape[0],
+            coarse_step=coarse_rotation_step,
+            fine_range=fine_rotation_range,
+            fine_step=fine_rotation_step,
+            buffer_px=buffer_px,
+        )
+
+    # Make the reference image used for the output canvas match the scaled
+    # grayscale that was registered (identical dimensions).
+    ref_reg_h, ref_reg_w = ref_gray.shape
+    if abs(scale_total - 1.0) > 1e-9:
+        if use_ihc:
+            ihc_full_reg = np.stack([
+                cv.resize(ihc_full_reg[c], (ref_reg_w, ref_reg_h),
+                          interpolation=cv.INTER_LINEAR)
+                for c in range(ihc_full_reg.shape[0])
+            ])
+        else:
+            he_img = he_img.resize((ref_reg_w, ref_reg_h), Image.Resampling.LANCZOS)
+        _log(f"  Reference scaled by {scale_total:.4f} -> {ref_reg_w}x{ref_reg_h}")
+        _log(f"  Implied true reference pixel size = {ref_pixel_um * scale_total:.4f} um/px "
+             f"(if maldi_pixel_um={maldi_pixel_um} is correct), or MALDI pitch = "
+             f"{maldi_pixel_um / scale_total:.2f} um (if the reference pixel size is correct)")
     del ref_gray, maldi_gray
     gc.collect()
 
@@ -1270,6 +1493,8 @@ def load_and_align(
             src_h=ref_reg_h,
             rotation_deg=best_rot,
             buffer_px=buffer_px,
+            min_w=tmpl_w,
+            min_h=tmpl_h,
         )
         del ihc_full_reg
         gc.collect()
@@ -1288,11 +1513,46 @@ def load_and_align(
             src_h        = ref_reg_h,
             rotation_deg = best_rot,
             buffer_px    = buffer_px,
+            min_w        = tmpl_w,
+            min_h        = tmpl_h,
         )
         del he_img
         gc.collect()
         ihc_canvas_up = None
         he_canvas_dummy = he_canvas
+
+    # ------------------------------------------------------------------
+    # 8b. Crop canvas to the union of the reference image and MALDI.
+    #     M_stored, best_idx and the canvas placement are all shifted by
+    #     the same (x0, y0), so every downstream step (annotations,
+    #     SpatialData) stays in a consistent coordinate system.
+    # ------------------------------------------------------------------
+    if use_ihc:
+        ch, cw = ihc_canvas_reg.shape[1:3]
+    else:
+        ch, cw = he_canvas.shape[:2]
+
+    x0, y0, x1, y1 = _union_crop(
+        ch, cw, M_stored, ref_reg_w, ref_reg_h,
+        best_idx, spectra_all.shape[:2], maldi_pixel_um / loaded_mpp,
+    )
+
+    if use_ihc:
+        ihc_canvas_reg = np.ascontiguousarray(ihc_canvas_reg[:, y0:y1, x0:x1])
+        first_ch = ihc_canvas_reg[0]
+        he_canvas_dummy = np.stack([first_ch, first_ch, first_ch], axis=-1)
+    else:
+        he_canvas = np.ascontiguousarray(he_canvas[y0:y1, x0:x1])
+        he_canvas_dummy = he_canvas
+
+    M_stored = M_stored.copy()
+    M_stored[0, 2] -= x0
+    M_stored[1, 2] -= y0
+    best_idx = (best_idx[0] - y0, best_idx[1] - x0)
+    canvas_pr -= y0
+    canvas_pc -= x0
+    _log(f"  Cropped canvas: x[{x0}:{x1}] y[{y0}:{y1}]  ->  {x1 - x0}x{y1 - y0}  "
+         f"(was {cw}x{ch})")
 
     # ------------------------------------------------------------------
     # 9. Annotations
@@ -1302,7 +1562,7 @@ def load_and_align(
         _log(f"Transforming annotations: {geojson_path} ...")
         annotation_gdf = _transform_geojson(
             geojson_path       = geojson_path,
-            he_pixel_um        = ref_pixel_um,
+            he_pixel_um        = ref_pixel_um * scale_total,
             reg_mpp            = loaded_mpp,
             M_stored           = M_stored,
             img_upscaling      = img_upscaling,
@@ -1351,6 +1611,8 @@ def load_and_align(
         "canvas_shape":     list(he_canvas_dummy.shape[:2]),
         "he_reg_size":      [int(ref_reg_h), int(ref_reg_w)],
         "canvas_placement": [int(canvas_pr), int(canvas_pc)],
+        "canvas_crop":      [int(x0), int(y0), int(x1), int(y1)],
+        "ref_scale":        float(scale_total),
         "affine_matrix":    M_stored.tolist(),
     }
 
