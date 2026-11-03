@@ -7,13 +7,12 @@ import matplotlib.pyplot as plt
 
 from shapely.affinity import affine_transform
 from shapely.geometry import Polygon
-from spatialdata.transformations import get_transformation
+from spatialdata.transformations import Affine, set_transformation, get_transformation
 from spatialdata.models import Image2DModel, ShapesModel, TableModel
 from scipy.ndimage import binary_fill_holes
 from skimage.color import rgb2hsv
 from skimage.filters import threshold_otsu, gaussian
 from skimage.morphology import remove_small_objects
-
 
 
 def make_gp_image_patches(sdata, image_key="he_image", coordinate_system="aligned", roi_key="pixels",patch_width=2000, patch_overlap=50, key_added=None):
@@ -131,3 +130,19 @@ def tissue_mask(sdata, image_key="he_image_pyr", roi_key="region_of_interest",
         transformations=get_transformation(sdata[source_key], get_all=True),
     )
     return mask
+
+
+
+def fullres_to_sdata_affine(sdata, full_w, full_h):
+    """3x3 affine: full-res image coords -> sdata 'global' coords."""
+    t = sdata["maldi_adata"].uns["he_transform"]
+    M_stored = np.array(t["affine_matrix"], dtype=float)  # reg px -> cropped canvas px
+    us = float(t["img_upscaling"])
+    ref_h, ref_w = t["he_reg_size"]                       # registered reference size (after ref_scale)
+    sx, sy = ref_w / full_w, ref_h / full_h               # full-res px -> reg px
+
+    # full-res coords (pixel edge = 0) -> reg-res pixel index
+    to_reg = np.array([[sx, 0, -0.5], [0, sy, -0.5], [0, 0, 1]])
+    # canvas pixel index -> sdata coords (matches the nearest-neighbour upsample)
+    up = np.array([[us, 0, 0.5 * us], [0, us, 0.5 * us], [0, 0, 1]])
+    return up @ M_stored @ to_reg
