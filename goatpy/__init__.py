@@ -16,7 +16,7 @@ from .bin import bin_and_align, bin_imzml
 from .plotting import check_batch, plot_spectrum, plot_spectra_comparison
 from .batch_correction import batch_correction
 from .analysis_gui import launch_goatpy_gui 
-from .sopa_segmentation import make_gp_image_patches, add_n_cells_per_pixel
+from .sopa_segmentation import make_gp_image_patches, add_n_cells_per_pixel, add_pyramid, tissue_mask
 from .calibration import calibrate_imzml_file
 
 __all__ = [
@@ -46,7 +46,9 @@ __all__ = [
     "make_gp_image_patches",
     "spatial_autocorrelation",
     "add_n_cells_per_pixel",
-    "calibrate_imzml_file"
+    "calibrate_imzml_file",
+    "add_pyramid",
+    "tissue_mask"
 ]
 
 __version__ = "0.1.0"

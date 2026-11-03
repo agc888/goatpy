@@ -87,7 +87,7 @@ def add_pyramid(sdata, image_key="he_image", key_added="he_image_pyr",
     return key_added
 
 
-def tissue_roi(sdata, image_key="he_image_pyr", roi_key="region_of_interest",
+def tissue_mask(sdata, image_key="he_image_pyr", roi_key="region_of_interest",
                source_key="he_image", level=2, thr_mult=0.4, close_size=41,
                min_obj=500, sigma=1, plot=True):
     """Saturation-based tissue mask -> polygons stored in sdata.shapes[roi_key].
