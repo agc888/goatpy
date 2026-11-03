@@ -1,10 +1,15 @@
+from __future__ import annotations
+
+import warnings
 import sopa
 import numpy as np, cv2
 import pandas as pd
 import geopandas as gpd
 import spatialdata as sd
 import matplotlib.pyplot as plt
+import scipy.sparse as sp
 
+from anndata import AnnData
 from shapely.affinity import affine_transform
 from shapely.geometry import Polygon
 from spatialdata.transformations import Affine, set_transformation, get_transformation
@@ -185,3 +190,392 @@ def add_fullres_to_sdata(
 
     return sdata
 
+
+
+
+def _get_polygons(sdata, name, coordinate_system):
+    """Fetch a shapes element in the target coordinate system as polygons."""
+    gdf = sd.transform(sdata.shapes[name], to_coordinate_system=coordinate_system)
+    gdf = gdf.copy()
+
+    # circles (Point + radius) -> polygons
+    if (gdf.geometry.geom_type == "Point").all():
+        if "radius" not in gdf.columns:
+            raise ValueError(f"'{name}' contains points but has no 'radius' column.")
+        gdf["geometry"] = gdf.geometry.buffer(gdf["radius"])
+
+    # fix invalid geometries (common in segmentation output)
+    invalid = ~gdf.geometry.is_valid
+    if invalid.any():
+        gdf.loc[invalid, "geometry"] = gdf.loc[invalid, "geometry"].buffer(0)
+
+    gdf = gdf[~gdf.geometry.is_empty]
+    return gdf[["geometry"]]
+
+
+def pixels_to_cells(
+    sdata: sd.SpatialData,
+    pixel_layer: str = "pixels",
+    cell_layer: str = "cell_segmentation",
+    table_name: str = "maldi_adata",
+    coordinate_system: str = "aligned",
+    layer: str | None = None,
+    key_added: str = "cell_glycans",
+    min_coverage: float = 0.0,
+    overwrite: bool = False,
+    inplace: bool = True,
+) -> AnnData:
+    """
+    Transfer MALDI pixel intensities onto segmented cells using area-weighted averaging.
+
+    For each cell:  I_cell = sum_i(overlap_area_i * I_pixel_i) / sum_i(overlap_area_i)
+
+    Parameters
+    ----------
+    sdata
+        SpatialData object.
+    pixel_layer
+        Shapes layer holding the MALDI pixel footprints.
+    cell_layer
+        Shapes layer holding the single-cell polygons.
+    table_name
+        Table with the glycan intensities (annotating ``pixel_layer``).
+    coordinate_system
+        Coordinate system in which overlaps are computed.
+    layer
+        Layer of the table to use (default: ``.X``). Use a normalised layer.
+    key_added
+        Name of the new table annotating ``cell_layer``.
+    min_coverage
+        Drop cells where less than this fraction of the cell area overlaps
+        MALDI pixels (0-1). Cells with no overlap are always dropped.
+    overwrite
+        Overwrite ``key_added`` if it already exists.
+    inplace
+        Add the table to ``sdata``. Always returns the AnnData.
+
+    Returns
+    -------
+    AnnData (cells x glycans) with QC columns in ``.obs``:
+        n_pixels            number of pixels overlapping the cell
+        frac_cell_covered   fraction of cell area that overlaps MALDI pixels
+        max_pixel_weight    weight of the dominant pixel (1.0 = cell sits in one pixel)
+        cell_area           cell area in coordinate-system units
+    """
+    if key_added in sdata.tables and not overwrite:
+        raise ValueError(f"Table '{key_added}' already exists. Use overwrite=True.")
+
+    # ---- 1. intensity table, matched to pixel shapes -----------------------
+    adata = sdata.tables[table_name]
+    attrs = adata.uns["spatialdata_attrs"]
+    region_key, instance_key = attrs["region_key"], attrs["instance_key"]
+
+    adata_pix = adata[adata.obs[region_key] == pixel_layer]
+    if adata_pix.n_obs == 0:
+        raise ValueError(f"Table '{table_name}' has no rows annotating '{pixel_layer}'.")
+
+    X = adata_pix.layers[layer] if layer is not None else adata_pix.X
+    X = sp.csr_matrix(X) if sp.issparse(X) else np.asarray(X, dtype=float)
+    if not sp.issparse(X) and np.isnan(X).any():
+        warnings.warn(
+            "NaNs found in intensity matrix; affected cells will be NaN. "
+            "Consider filling or removing off-tissue pixels first."
+        )
+
+    # ---- 2. geometries in a common coordinate system ----------------------
+    pix = _get_polygons(sdata, pixel_layer, coordinate_system)
+    cel = _get_polygons(sdata, cell_layer, coordinate_system)
+
+    # column j of the weight matrix <-> row j of X
+    ids = adata_pix.obs[instance_key].to_numpy()
+    pix = pix.reindex(ids)
+    if pix.geometry.isna().any():
+        raise ValueError("Some table rows have no matching shape in the pixel layer.")
+    pix = pix.reset_index(drop=True)
+    pix["pix_idx"] = np.arange(len(pix))
+
+    cell_ids = cel.index.to_numpy()
+    cel = cel.reset_index(drop=True)
+    cel["cell_idx"] = np.arange(len(cel))
+    cell_area = cel.geometry.area.to_numpy()
+    
+    # centroids in the same coordinate system as the overlap calculation
+    centroids = cel.geometry.centroid
+    xy = np.column_stack([centroids.x.to_numpy(), centroids.y.to_numpy()])   # x, y
+
+        # ---- 3. overlap areas -> sparse weight matrix --------------------------
+    ov = gpd.overlay(
+        cel[["cell_idx", "geometry"]],
+        pix[["pix_idx", "geometry"]],
+        how="intersection",
+        keep_geom_type=True,
+    )
+    ov["area"] = ov.geometry.area
+    ov = ov[ov["area"] > 0]
+
+    W = sp.csr_matrix(
+        (ov["area"].to_numpy(), (ov["cell_idx"].to_numpy(), ov["pix_idx"].to_numpy())),
+        shape=(len(cel), len(pix)),
+    )
+    W.sum_duplicates()
+    covered = np.asarray(W.sum(axis=1)).ravel()   # cell area that overlaps data
+    safe = np.where(covered > 0, covered, 1.0)
+
+    # row-normalised weights; force CSR so .data/.indptr are reliable
+    W_norm = sp.csr_matrix(sp.diags(1.0 / safe) @ W)
+    W_norm.eliminate_zeros()
+
+    # per-row max straight from the CSR structure
+    row_counts = np.diff(W_norm.indptr)
+    max_w = np.zeros(W_norm.shape[0])
+    nonempty = row_counts > 0
+    max_w[nonempty] = np.maximum.reduceat(W_norm.data, W_norm.indptr[:-1][nonempty])
+
+    # sanity checks: every covered row should sum to 1
+    row_sums = np.asarray(W_norm.sum(axis=1)).ravel()
+    assert np.allclose(row_sums[covered > 0], 1.0), "Weights are not normalised."
+
+    # ---- 4. transfer -------------------------------------------------------
+    X_cells = W_norm @ X
+    if sp.issparse(X_cells):
+        X_cells = sp.csr_matrix(X_cells)
+
+    obs = pd.DataFrame(
+        {
+            "n_pixels": row_counts,
+            "frac_cell_covered": np.clip(covered / cell_area, 0, 1),
+            "max_pixel_weight": max_w,
+            "cell_area": cell_area,
+        }
+    )
+    obs["cell_id"] = cell_ids
+    obs["region"] = cell_layer
+
+    # ---- 5. filter, build AnnData, register in sdata -----------------------
+    keep = (covered > 0) & (obs["frac_cell_covered"].to_numpy() >= min_coverage)
+    n_dropped = int((~keep).sum())
+    if n_dropped:
+        print(f"Dropping {n_dropped}/{len(keep)} cells with insufficient MALDI coverage.")
+
+    obs = obs.loc[keep].reset_index(drop=True)
+    obs.index = obs["cell_id"].astype(str).to_numpy()
+    out = AnnData(X=X_cells[keep], obs=obs, var=adata_pix.var.copy())
+
+    # cells x pixels weights, aligned to out.obs; columns <-> uns["pixel_ids"]
+    out.obsm["pixel_weights"] = W_norm[keep]
+    out.uns["pixel_ids"] = np.asarray(ids).astype(str)
+
+    out.obsm["spatial"] = xy[keep]
+    out.uns["spatial_coordinate_system"] = coordinate_system
+
+
+    out.uns["pixels_to_cells"] = {
+        "pixel_layer": pixel_layer,
+        "cell_layer": cell_layer,
+        "source_table": table_name,
+        "source_layer": layer if layer is not None else "X",
+        "coordinate_system": coordinate_system,
+        "method": "area_weighted_mean",
+        "min_coverage": min_coverage,
+    }
+
+    out = TableModel.parse(
+        out, region=cell_layer, region_key="region", instance_key="cell_id"
+    )
+
+    if inplace:
+        if key_added in sdata.tables:
+            del sdata.tables[key_added]
+        sdata.tables[key_added] = out
+        if sdata.is_backed():
+            sdata.write_element(key_added, overwrite=True)
+
+    return out
+    obs = pd.DataFrame(
+        {
+            "n_pixels": row_counts,
+            "frac_cell_covered": np.clip(covered / cell_area, 0, 1),
+            "max_pixel_weight": max_w,
+            "cell_area": cell_area,
+        }
+    )
+    obs["cell_id"] = cell_ids
+    obs["region"] = cell_layer
+
+    # ---- 5. filter, build AnnData, register in sdata -----------------------
+    keep = (covered > 0) & (obs["frac_cell_covered"].to_numpy() >= min_coverage)
+    n_dropped = int((~keep).sum())
+    if n_dropped:
+        print(f"Dropping {n_dropped}/{len(keep)} cells with insufficient MALDI coverage.")
+
+    obs = obs.loc[keep].reset_index(drop=True)
+    obs.index = obs["cell_id"].astype(str).to_numpy()
+    out = AnnData(X=X_cells[keep], obs=obs, var=adata_pix.var.copy())
+
+    # cells x pixels weights, aligned to out.obs; columns <-> uns["pixel_ids"]
+    out.obsm["pixel_weights"] = W_norm[keep]
+    out.uns["pixel_ids"] = np.asarray(ids).astype(str)
+
+    out.uns["pixels_to_cells"] = {
+        "pixel_layer": pixel_layer,
+        "cell_layer": cell_layer,
+        "source_table": table_name,
+        "source_layer": layer if layer is not None else "X",
+        "coordinate_system": coordinate_system,
+        "method": "area_weighted_mean",
+        "min_coverage": min_coverage,
+    }
+
+    out = TableModel.parse(
+        out, region=cell_layer, region_key="region", instance_key="cell_id"
+    )
+
+    if inplace:
+        if key_added in sdata.tables:
+            del sdata.tables[key_added]
+        sdata.tables[key_added] = out
+        if sdata.is_backed():
+            sdata.write_element(key_added, overwrite=True)
+
+    return out
+    obs = pd.DataFrame(
+        {
+            "n_pixels": row_counts,
+            "frac_cell_covered": np.clip(covered / cell_area, 0, 1),
+            "max_pixel_weight": max_w,
+            "cell_area": cell_area,
+        }
+    )
+    obs["cell_id"] = cell_ids
+    obs["region"] = cell_layer
+
+    # ---- 5. filter, build AnnData, register in sdata -----------------------
+    keep = (covered > 0) & (obs["frac_cell_covered"].to_numpy() >= min_coverage)
+    n_dropped = int((~keep).sum())
+    if n_dropped:
+        print(f"Dropping {n_dropped}/{len(keep)} cells with insufficient MALDI coverage.")
+
+    obs = obs.loc[keep].reset_index(drop=True)
+    obs.index = obs["cell_id"].astype(str).to_numpy()
+    out = AnnData(X=X_cells[keep], obs=obs, var=adata_pix.var.copy())
+
+    # cells x pixels weights, aligned to out.obs; columns <-> uns["pixel_ids"]
+    out.obsm["pixel_weights"] = W_norm[keep]
+    out.uns["pixel_ids"] = np.asarray(ids).astype(str)
+
+    out.uns["pixels_to_cells"] = {
+        "pixel_layer": pixel_layer,
+        "cell_layer": cell_layer,
+        "source_table": table_name,
+        "source_layer": layer if layer is not None else "X",
+        "coordinate_system": coordinate_system,
+        "method": "area_weighted_mean",
+        "min_coverage": min_coverage,
+    }
+
+    out = TableModel.parse(
+        out, region=cell_layer, region_key="region", instance_key="cell_id"
+    )
+
+    if inplace:
+        if key_added in sdata.tables:
+            del sdata.tables[key_added]
+        sdata.tables[key_added] = out
+        if sdata.is_backed():
+            sdata.write_element(key_added, overwrite=True)
+
+    return out
+    obs = pd.DataFrame(
+        {
+            "n_pixels": row_counts,
+            "frac_cell_covered": np.clip(covered / cell_area, 0, 1),
+            "max_pixel_weight": max_w,
+            "cell_area": cell_area,
+        }
+    )
+    obs["cell_id"] = cell_ids
+    obs["region"] = cell_layer
+
+    # ---- 5. filter, build AnnData, register in sdata -----------------------
+    keep = (covered > 0) & (obs["frac_cell_covered"].to_numpy() >= min_coverage)
+    n_dropped = int((~keep).sum())
+    if n_dropped:
+        print(f"Dropping {n_dropped}/{len(keep)} cells with insufficient MALDI coverage.")
+
+    obs = obs.loc[keep].reset_index(drop=True)
+    obs.index = obs["cell_id"].astype(str).to_numpy()
+    out = AnnData(X=X_cells[keep], obs=obs, var=adata_pix.var.copy())
+
+    # cells x pixels weights, aligned to out.obs; columns <-> uns["pixel_ids"]
+    out.obsm["pixel_weights"] = W_norm[keep]
+    out.uns["pixel_ids"] = np.asarray(ids).astype(str)
+
+    out.uns["pixels_to_cells"] = {
+        "pixel_layer": pixel_layer,
+        "cell_layer": cell_layer,
+        "source_table": table_name,
+        "source_layer": layer if layer is not None else "X",
+        "coordinate_system": coordinate_system,
+        "method": "area_weighted_mean",
+        "min_coverage": min_coverage,
+    }
+
+    out = TableModel.parse(
+        out, region=cell_layer, region_key="region", instance_key="cell_id"
+    )
+
+    if inplace:
+        if key_added in sdata.tables:
+            del sdata.tables[key_added]
+        sdata.tables[key_added] = out
+        if sdata.is_backed():
+            sdata.write_element(key_added, overwrite=True)
+
+    return out
+    obs = pd.DataFrame(
+        {
+            "n_pixels": row_counts,
+            "frac_cell_covered": np.clip(covered / cell_area, 0, 1),
+            "max_pixel_weight": max_w,
+            "cell_area": cell_area,
+        }
+    )
+    obs["cell_id"] = cell_ids
+    obs["region"] = cell_layer
+
+    # ---- 5. filter, build AnnData, register in sdata -----------------------
+    keep = (covered > 0) & (obs["frac_cell_covered"].to_numpy() >= min_coverage)
+    n_dropped = int((~keep).sum())
+    if n_dropped:
+        print(f"Dropping {n_dropped}/{len(keep)} cells with insufficient MALDI coverage.")
+
+    obs = obs.loc[keep].reset_index(drop=True)
+    obs.index = obs["cell_id"].astype(str).to_numpy()
+    out = AnnData(X=X_cells[keep], obs=obs, var=adata_pix.var.copy())
+
+    # cells x pixels weights, aligned to out.obs; columns <-> uns["pixel_ids"]
+    out.obsm["pixel_weights"] = W_norm[keep]
+    out.uns["pixel_ids"] = np.asarray(ids).astype(str)
+
+    out.uns["pixels_to_cells"] = {
+        "pixel_layer": pixel_layer,
+        "cell_layer": cell_layer,
+        "source_table": table_name,
+        "source_layer": layer if layer is not None else "X",
+        "coordinate_system": coordinate_system,
+        "method": "area_weighted_mean",
+        "min_coverage": min_coverage,
+    }
+
+    out = TableModel.parse(
+        out, region=cell_layer, region_key="region", instance_key="cell_id"
+    )
+
+    if inplace:
+        if key_added in sdata.tables:
+            del sdata.tables[key_added]
+        sdata.tables[key_added] = out
+        if sdata.is_backed():
+            sdata.write_element(key_added, overwrite=True)
+
+    return out
