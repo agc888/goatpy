@@ -15,6 +15,7 @@ from skimage.filters import threshold_otsu, gaussian
 from skimage.morphology import remove_small_objects
 
 
+
 def make_gp_image_patches(sdata, image_key="he_image", coordinate_system="aligned", roi_key="pixels",patch_width=2000, patch_overlap=50, key_added=None):
     """
     Generates image patches for the given image based on the specified coordinate system (i.e. aligned). 
@@ -132,17 +133,55 @@ def tissue_mask(sdata, image_key="he_image_pyr", roi_key="region_of_interest",
     return mask
 
 
-
-def fullres_to_sdata_affine(sdata, full_w, full_h):
+def fullres_to_sdata_affine(sdata, full_w, full_h, transform_key="he_transform"):
     """3x3 affine: full-res image coords -> sdata 'global' coords."""
-    t = sdata["maldi_adata"].uns["he_transform"]
-    M_stored = np.array(t["affine_matrix"], dtype=float)  # reg px -> cropped canvas px
+    t = sdata["maldi_adata"].uns[transform_key]
+    M_stored = np.array(t["affine_matrix"], dtype=float)   # reg px -> cropped canvas px
     us = float(t["img_upscaling"])
-    ref_h, ref_w = t["he_reg_size"]                       # registered reference size (after ref_scale)
-    sx, sy = ref_w / full_w, ref_h / full_h               # full-res px -> reg px
+    ref_h, ref_w = t["he_reg_size"]                        # registered reference size (after ref_scale)
+    sx, sy = ref_w / full_w, ref_h / full_h                # full-res px -> reg px
 
-    # full-res coords (pixel edge = 0) -> reg-res pixel index
     to_reg = np.array([[sx, 0, -0.5], [0, sy, -0.5], [0, 0, 1]])
-    # canvas pixel index -> sdata coords (matches the nearest-neighbour upsample)
     up = np.array([[us, 0, 0.5 * us], [0, us, 0.5 * us], [0, 0, 1]])
     return up @ M_stored @ to_reg
+
+
+def add_fullres_to_sdata(
+    sdata,
+    he,
+    image_key="he_image_pyr",          # key in `he` (multiscale full-res image)
+    shapes_keys=("cell_segmentation",),  # keys in `he` to carry across
+    image_key_out="he_fullres",
+    table_key="maldi_adata",
+    coordinate_system="global",
+    reload=True,
+):
+    """Add the full-res H&E (and shapes such as cell segmentation) from `he`
+    into `sdata`, using the registration stored in sdata[table_key].uns['he_transform'].
+
+    reload=True re-reads elements from he's zarr store so `he` itself is not modified.
+    """
+    if reload:
+        if he.path is None:
+            raise ValueError("`he` has no zarr store; write it first or use reload=False.")
+        src = sd.read_zarr(he.path)
+    else:
+        src = he
+
+    img = src[image_key]
+    scale0 = img["scale0"]["image"] if hasattr(img, "keys") else img
+    _, H, W = scale0.shape
+
+    A = fullres_to_sdata_affine(sdata, W, H)
+    T = Affine(A, input_axes=("x", "y"), output_axes=("x", "y"))
+
+    set_transformation(img, T, to_coordinate_system=coordinate_system)
+    sdata[image_key_out] = img
+
+    for key in shapes_keys:
+        shp = src[key]
+        set_transformation(shp, T, to_coordinate_system=coordinate_system)
+        sdata[key] = shp
+
+    return sdata
+
