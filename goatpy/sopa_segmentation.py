@@ -1,12 +1,19 @@
 import sopa
-import numpy as np
+import numpy as np, cv2
 import pandas as pd
 import geopandas as gpd
 import spatialdata as sd
+import matplotlib.pyplot as plt
 
 from shapely.affinity import affine_transform
+from shapely.geometry import Polygon
 from spatialdata.transformations import get_transformation
-from spatialdata.models import ShapesModel, TableModel
+from spatialdata.models import Image2DModel, ShapesModel, TableModel
+from scipy.ndimage import binary_fill_holes
+from skimage.color import rgb2hsv
+from skimage.filters import threshold_otsu, gaussian
+from skimage.morphology import remove_small_objects
+
 
 
 def make_gp_image_patches(sdata, image_key="he_image", coordinate_system="aligned", roi_key="pixels",patch_width=2000, patch_overlap=50, key_added=None):
@@ -65,3 +72,62 @@ def add_n_cells_per_pixel(
 
     adata.obs["n_cells"] = n_cells.reindex(adata.obs[instance_key]).to_numpy()
     return sdata
+
+
+
+def add_pyramid(sdata, image_key="he_image", key_added="he_image_pyr",
+                scale_factors=(4, 4, 4), chunks=(3, 2048, 2048)):
+    """Build a multiscale copy of a single-scale image (skipped if it already exists)."""
+    if key_added in sdata.images:
+        return key_added
+    full = sdata[image_key]["scale0"]["image"]  # DataArray with transforms attached
+    sdata[key_added] = Image2DModel.parse(
+        full, scale_factors=list(scale_factors), chunks=chunks
+    )
+    return key_added
+
+
+def tissue_roi(sdata, image_key="he_image_pyr", roi_key="region_of_interest",
+               source_key="he_image", level=2, thr_mult=0.4, close_size=41,
+               min_obj=500, sigma=1, plot=True):
+    """Saturation-based tissue mask -> polygons stored in sdata.shapes[roi_key].
+
+    level      : pyramid level used for the mask (2 = 1/16 scale)
+    thr_mult   : multiplier on the Otsu threshold; lower = more inclusive
+    close_size : closing kernel (px at `level`); bigger bridges gaps in adipose
+    min_obj    : minimum object size (px at `level`) to keep
+    """
+    pyr = sdata[image_key]
+    scales = list(pyr.keys())
+    arr = pyr[scales[level]]["image"].values              # (c, y, x)
+    full_shape = pyr[scales[0]]["image"].shape
+    sy = full_shape[1] / arr.shape[1]
+    sx = full_shape[2] / arr.shape[2]
+
+    rgb = np.moveaxis(arr[:3], 0, -1)
+    sat = gaussian(rgb2hsv(rgb)[..., 1], sigma=sigma)
+
+    mask = sat > threshold_otsu(sat) * thr_mult
+    mask = remove_small_objects(mask, min_size=min_obj)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
+    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, k)
+    mask = binary_fill_holes(mask).astype(np.uint8)
+
+    if plot:
+        fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+        ax[0].imshow(rgb)
+        ax[1].imshow(rgb)
+        ax[1].contour(mask, levels=[0.5], colors="k", linewidths=1)
+        plt.show()
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polys = [Polygon(c[:, 0, :] * [sx, sy]) for c in contours if len(c) >= 3]
+    polys = [p.buffer(0) for p in polys if p.area > 0]
+
+    if roi_key in sdata.shapes:
+        del sdata[roi_key]
+    sdata[roi_key] = ShapesModel.parse(
+        gpd.GeoDataFrame(geometry=polys),
+        transformations=get_transformation(sdata[source_key], get_all=True),
+    )
+    return mask
