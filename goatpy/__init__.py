@@ -18,6 +18,7 @@ from .batch_correction import batch_correction
 from .analysis_gui import launch_goatpy_gui 
 from .sopa_segmentation import make_gp_image_patches, add_n_cells_per_pixel, add_pyramid, tissue_mask, add_fullres_to_sdata, pixels_to_cells
 from .calibration import calibrate_imzml_file
+from .deconvolution import deconvolve_maldi_to_cells, run_decon_PCA, compare_models, compare_morphology_clusters, plot_pixel_pies, evaluate_deconvolution, plot_model_comparison
 
 __all__ = [
     "Add_Pseudo_Image",
@@ -50,7 +51,14 @@ __all__ = [
     "add_pyramid",
     "tissue_mask",
     "add_fullres_to_sdata",
-    "pixels_to_cells"
+    "pixels_to_cells",
+    "deconvolve_maldi_to_cells", 
+    "run_decon_PCA",
+    "compare_models",
+    "compare_morphology_clusters",
+    "plot_pixel_pies",
+    "evaluate_deconvolution", 
+    "plot_model_comparison"
 ]
 
 __version__ = "0.1.0"
