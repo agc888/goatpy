@@ -56,8 +56,6 @@ Note: "morphology_group" is the intermediate prior used by the "morphology_*" mo
 is not a cell-type label. To get cell types, cluster the deconvolved .X (e.g. scanpy leiden)
 and pass that column to plot_pixel_pies().
 
-
-
 """
 
 from __future__ import annotations
