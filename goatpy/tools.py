@@ -1,3 +1,4 @@
+import re
 import numpy as np
 import pandas as pd
 import pkg_resources
@@ -11,6 +12,11 @@ from anndata import AnnData
 import scipy.sparse as sp_sparse
 from sklearn.neighbors import NearestNeighbors
 from spatialdata.models import TableModel
+
+from shapely.affinity import affine_transform
+from rasterio.features import rasterize
+from affine import Affine
+from spatialdata.transformations import get_transformation
 
 
 def annotate_glycans(
@@ -711,7 +717,6 @@ def merge_spatialdata(
 
     return merged
 
-
 def _is_float(v: str) -> bool:
     """Helper: return True if string v can be parsed as float."""
     try:
@@ -720,11 +725,6 @@ def _is_float(v: str) -> bool:
     except (ValueError, TypeError):
         return False
     
-
-
-
-
-
 def _build_spatial_weights(coords, n_neighbors=6):
     n = coords.shape[0]
     nn = NearestNeighbors(n_neighbors=n_neighbors + 1).fit(coords)
@@ -789,3 +789,465 @@ def spatial_autocorrelation(
 
     result["abs_I"] = result["bivariate_moran_I"].abs()
     return result.sort_values("abs_I", ascending=False).drop(columns="abs_I").head(top_n).reset_index(drop=True)
+
+def extract_channel_intensity(
+    sdata,
+    shape="cell_segmentation",
+    table="cell_decon",
+    image="ihc_image",
+    channels=None,
+    column_names=None,
+    coordinate_system="aligned",
+    normalize=True,
+    filter_out=None,
+    filter_percentile=95,
+    mad_threshold=3.5,
+):
+    """
+    Extract mean fluorescence intensity for each SpatialData shape.
+
+    Results are matched to table observations by instance ID
+    and stored in the specified table's .obs.
+
+    Parameters
+    ----------
+    sdata : SpatialData
+        SpatialData object.
+
+    shape : str
+        Shape element, e.g. "pixels" or "cell_segmentation".
+
+    table : str
+        AnnData table, e.g. "cell_decon" or "maldi_adata".
+
+    image : str
+        Image element containing fluorescence channels.
+
+    channels : int, str, list or None
+        Channels to extract. None selects all channels.
+
+    column_names : str, list or None
+        Output .obs column names.
+
+    coordinate_system : str
+        Shared spatial coordinate system.
+
+    normalize : bool
+        Min-max normalise intensities to [0, 1] after filtering.
+
+    filter_out : None or str
+        None   : No filtering.
+        "clip" : Clip values above filter_percentile.
+        "trim" : Remove values outside the central percentile
+                 interval (e.g. 2.5–97.5 for 95).
+        "mad"  : Remove extreme values based on robust MAD.
+
+    filter_percentile : float
+        Percentile used for clipping, or central percentage
+        retained when trimming.
+
+    mad_threshold : float
+        Modified Z-score threshold for MAD filtering.
+
+    Returns
+    -------
+    SpatialData
+        Updated object containing fluorescence values in .obs.
+    """
+
+    # ========================================================
+    # 1. Validate options and load elements
+    # ========================================================
+
+    if filter_out not in (None, "clip", "trim", "mad"):
+        raise ValueError(
+            "filter_out must be None, 'clip', 'trim', or 'mad'."
+        )
+
+    if not 0 < filter_percentile <= 100:
+        raise ValueError(
+            "filter_percentile must be between 0 and 100."
+        )
+
+    if mad_threshold <= 0:
+        raise ValueError("mad_threshold must be positive.")
+
+    img = sdata.images[image]
+    shapes = sdata.shapes[shape]
+    adata = sdata.tables[table]
+
+    # Handle multiscale and single-scale images
+    if hasattr(img, "children"):
+        image_data = img["scale0"]["image"]
+    else:
+        image_data = img
+
+    # ========================================================
+    # 2. Select channels
+    # ========================================================
+
+    if "c" in image_data.dims:
+        available = list(image_data.coords["c"].values)
+
+        if channels is None:
+            selected = available
+        else:
+            if isinstance(channels, (int, str, np.integer)):
+                channels = [channels]
+
+            selected = []
+
+            for ch in channels:
+                if isinstance(ch, (int, np.integer)):
+                    selected.append(available[int(ch)])
+                else:
+                    if ch not in available:
+                        raise ValueError(
+                            f"Channel {ch} not found. "
+                            f"Available: {available}"
+                        )
+                    selected.append(ch)
+
+    else:
+        selected = ["channel_0"]
+
+        if channels is not None:
+            requested = (
+                [channels]
+                if isinstance(channels, (int, str, np.integer))
+                else list(channels)
+            )
+            if requested not in ([0], ["channel_0"]):
+                raise ValueError(
+                    "Image has no channel dimension."
+                )
+
+    # ========================================================
+    # 3. Output column names
+    # ========================================================
+
+    if column_names is None:
+        column_names = [str(ch) for ch in selected]
+
+    elif isinstance(column_names, str):
+        column_names = [column_names]
+
+    column_names = [
+        re.sub(r"[^A-Za-z0-9_.-]", "_", str(name))
+        for name in column_names
+    ]
+
+    if len(column_names) != len(selected):
+        raise ValueError(
+            "column_names must match selected channels."
+        )
+
+    if len(set(column_names)) != len(column_names):
+        raise ValueError(
+            "Column names must be unique."
+        )
+
+    # ========================================================
+    # 4. Shape -> image coordinate transformation
+    # ========================================================
+
+    shape_to_aligned = get_transformation(
+        shapes,
+        to_coordinate_system=coordinate_system
+    )
+
+    image_to_aligned = get_transformation(
+        img,
+        to_coordinate_system=coordinate_system
+    )
+
+    M_shapes = shape_to_aligned.to_affine_matrix(
+        input_axes=("x", "y"),
+        output_axes=("x", "y")
+    )
+
+    M_image = image_to_aligned.to_affine_matrix(
+        input_axes=("x", "y"),
+        output_axes=("x", "y")
+    )
+
+    matrix = np.linalg.inv(M_image) @ M_shapes
+
+    params = [
+        matrix[0, 0],
+        matrix[0, 1],
+        matrix[1, 0],
+        matrix[1, 1],
+        matrix[0, 2],
+        matrix[1, 2],
+    ]
+
+    geometries = [
+        affine_transform(geom, params)
+        if geom is not None and not geom.is_empty
+        else None
+        for geom in shapes.geometry
+    ]
+
+    # ========================================================
+    # 5. Rasterize shapes
+    # ========================================================
+
+    height = image_data.sizes["y"]
+    width = image_data.sizes["x"]
+
+    n_shapes = len(shapes)
+
+    if n_shapes == 0:
+        raise ValueError("No shapes found.")
+
+    if n_shapes > np.iinfo(np.int32).max:
+        raise ValueError("Too many shapes for int32 labels.")
+
+    internal_ids = np.arange(
+        1, n_shapes + 1, dtype=np.int32
+    )
+
+    raster_shapes = [
+        (geom, int(i))
+        for geom, i in zip(geometries, internal_ids)
+        if geom is not None and not geom.is_empty
+    ]
+
+    mask = rasterize(
+        raster_shapes,
+        out_shape=(height, width),
+        transform=Affine.identity(),
+        fill=0,
+        dtype="int32",
+    )
+
+    counts = np.bincount(
+        mask.ravel(),
+        minlength=n_shapes + 1
+    )[1:]
+
+    valid_pixels = mask > 0
+    labels = mask[valid_pixels]
+
+    # ========================================================
+    # 6. Match shape IDs to table observations
+    # ========================================================
+
+    attrs = adata.uns.get("spatialdata_attrs", {})
+    instance_key = attrs.get("instance_key")
+    region_key = attrs.get("region_key")
+
+    if instance_key is not None and instance_key in adata.obs:
+        observation_ids = pd.Index(
+            adata.obs[instance_key].astype(str)
+        )
+    else:
+        observation_ids = pd.Index(
+            adata.obs_names.astype(str)
+        )
+
+    shape_ids = pd.Index(shapes.index.astype(str))
+
+    if not shape_ids.is_unique:
+        raise ValueError("Shape indices must be unique.")
+
+    # Only assign to observations belonging to this shape
+    # region when the table contains multiple regions.
+    region_matches = np.ones(
+        adata.n_obs, dtype=bool
+    )
+
+    if region_key is not None and region_key in adata.obs:
+        region_matches = (
+            adata.obs[region_key].astype(str).to_numpy()
+            == shape
+        )
+
+    matches = (
+        observation_ids.isin(shape_ids)
+        & region_matches
+    )
+
+    if not matches.any():
+        raise ValueError(
+            "No matching observations found. "
+            "Check the table instance IDs and region."
+        )
+
+    print(f"\nImage: {image}")
+    print(f"Shapes: {shape} ({n_shapes})")
+    print(f"Table: {table}")
+    print(
+        f"Matching observations: "
+        f"{matches.sum()} / {adata.n_obs}"
+    )
+    print(f"Filtering: {filter_out}")
+
+    # ========================================================
+    # 7. Extract and filter channel intensities
+    # ========================================================
+
+    results = {}
+
+    for channel, column_name in zip(
+        selected, column_names
+    ):
+
+        if "c" in image_data.dims:
+            channel_data = image_data.sel(c=channel).values
+        else:
+            channel_data = image_data.values
+
+        channel_data = np.asarray(
+            channel_data, dtype=np.float64
+        )
+
+        # Exclude non-finite image pixels
+        usable = (
+            valid_pixels
+            & np.isfinite(channel_data)
+        )
+
+        channel_counts = np.bincount(
+            mask[usable],
+            minlength=n_shapes + 1
+        )[1:]
+
+        intensity_sum = np.bincount(
+            mask[usable],
+            weights=channel_data[usable],
+            minlength=n_shapes + 1
+        )[1:]
+
+        mean_intensity = np.full(
+            n_shapes, np.nan, dtype=np.float64
+        )
+
+        np.divide(
+            intensity_sum,
+            channel_counts,
+            out=mean_intensity,
+            where=channel_counts > 0
+        )
+
+        # ----------------------------------------------------
+        # Filtering (on mean intensity per shape)
+        # ----------------------------------------------------
+
+        filtered = mean_intensity.copy()
+        valid = np.isfinite(filtered)
+
+        if valid.any() and filter_out == "clip":
+
+            upper = np.percentile(
+                filtered[valid],
+                filter_percentile
+            )
+
+            filtered[valid] = np.minimum(
+                filtered[valid], upper
+            )
+
+        elif valid.any() and filter_out == "trim":
+
+            lower_pct = (100 - filter_percentile) / 2
+            upper_pct = 100 - lower_pct
+
+            lower, upper = np.percentile(
+                filtered[valid],
+                [lower_pct, upper_pct]
+            )
+
+            outside = (
+                valid
+                & (
+                    (filtered < lower)
+                    | (filtered > upper)
+                )
+            )
+
+            filtered[outside] = np.nan
+
+        elif valid.any() and filter_out == "mad":
+
+            median = np.median(filtered[valid])
+
+            mad = np.median(
+                np.abs(filtered[valid] - median)
+            )
+
+            if mad > 0:
+                modified_z = (
+                    0.6745
+                    * (filtered[valid] - median)
+                    / mad
+                )
+
+                valid_positions = np.flatnonzero(valid)
+
+                outlier_positions = valid_positions[
+                    np.abs(modified_z) > mad_threshold
+                ]
+
+                filtered[outlier_positions] = np.nan
+
+        # ----------------------------------------------------
+        # Normalise after filtering
+        # ----------------------------------------------------
+
+        if normalize:
+
+            valid = np.isfinite(filtered)
+
+            if valid.any():
+
+                minimum = filtered[valid].min()
+                maximum = filtered[valid].max()
+
+                if maximum > minimum:
+                    filtered[valid] = (
+                        (filtered[valid] - minimum)
+                        / (maximum - minimum)
+                    )
+                else:
+                    filtered[valid] = 0.0
+
+        # ----------------------------------------------------
+        # Match intensities to table
+        # ----------------------------------------------------
+
+        intensity_series = pd.Series(
+            filtered,
+            index=shape_ids
+        )
+
+        aligned_values = intensity_series.reindex(
+            observation_ids
+        ).to_numpy(dtype=float)
+
+        aligned_values[~region_matches] = np.nan
+
+        results[column_name] = aligned_values
+
+        n_before = np.isfinite(mean_intensity).sum()
+        n_after = np.isfinite(filtered).sum()
+
+        print(
+            f"  {channel} -> {column_name}: "
+            f"{n_after}/{n_before} valid shapes "
+            f"after filtering"
+        )
+
+    # ========================================================
+    # 8. Store results directly in existing table
+    # ========================================================
+
+    # Avoid reassigning sdata.tables[table], which would
+    # unnecessarily trigger SpatialData table validation.
+    for column_name, values in results.items():
+        adata.obs[column_name] = values
+
+    print("\nChannel intensity extraction complete.")
+
+    return sdata

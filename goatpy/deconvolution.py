@@ -68,8 +68,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import spatialdata as sd
 import matplotlib.pyplot as plt
-
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
@@ -79,6 +79,13 @@ from matplotlib import colors as mcolors
 from matplotlib.collections import PatchCollection, PolyCollection
 from matplotlib.patches import Patch, Wedge
 from scipy.cluster.hierarchy import dendrogram, linkage
+
+from spatialdata.transformations import (
+    get_transformation,
+    Identity,
+)
+from spatialdata.models import ShapesModel
+
 
 
 
@@ -997,70 +1004,313 @@ def plot_pixel_pies(
     legend: bool = True,
     title: Optional[str] = None,
     max_pixels: int = 60000,
+
+    # New options
+    image_key: Optional[str] = None,
+    coordinate_system: str = "global",
+    image_alpha: float = 1.0,
 ):
     """
-    One pie chart per MALDI pixel showing the make-up of the cells inside it.
+    One pie chart per MALDI pixel showing the composition of
+    overlapping cells, optionally overlaid on a SpatialData image.
 
     Parameters
     ----------
-    color : categorical .obs column of the cell table (e.g. a leiden clustering of .X,
-        or "morphology_group").
-    weight : "area" - each cell counts by its overlap area with the pixel (default);
-             "count" - each overlapping cell counts once.
-    roi : (xmin, ymin, xmax, ymax) in the table's coordinate system; strongly recommended
-        for large slides, where pies are unreadable and slow to draw at full scale.
-    radius_scale : pie radius as a fraction of half the pixel width.
+    image_key : str or None
+        Image displayed underneath the pies.
+        Examples: "he_fullres", "he_image", "ihc_normalized".
+        If None, only pies are plotted.
+
+    coordinate_system : str
+        Coordinate system used for plotting.
+        Examples: "global", "aligned".
+
+    image_alpha : float
+        Transparency of the background image (0–1).
+
+    roi : (xmin, ymin, xmax, ymax) or None
+        Region of interest in the selected coordinate system.
 
     Returns
     -------
-    (ax, props): props is a DataFrame (pixels x categories) of the plotted proportions.
+    ax, props
+        Matplotlib axis and DataFrame of pixel compositions.
     """
+
     if weight not in ("area", "count"):
         raise ValueError("weight must be 'area' or 'count'.")
+
+    if not 0 <= image_alpha <= 1:
+        raise ValueError("image_alpha must be between 0 and 1.")
+
     adata = sdata.tables[table]
+
     cat = _as_categorical(adata, color)
     cats = list(cat.cat.categories)
     K = len(cats)
+
     cmap = colors or _category_colors(adata, color, cats)
 
-    W = sp.csr_matrix(adata.obsm["pixel_overlap_area"])  # cells x pixels
+    # --------------------------------------------------
+    # 1. Calculate cell composition per MALDI pixel
+    # --------------------------------------------------
+
+    W = sp.csr_matrix(
+        adata.obsm["pixel_overlap_area"]
+    )
+
     if weight == "count":
         W = (W > 0).astype(np.float32)
+
     codes = cat.cat.codes.to_numpy()
     ok = codes >= 0
-    Z = sp.csr_matrix((np.ones(ok.sum(), np.float32), (np.flatnonzero(ok), codes[ok])), shape=(W.shape[0], K))
-    P = np.asarray((W.T @ Z).todense())  # pixels x K
-    tot = P.sum(1)
-    props = P / np.where(tot > 0, tot, 1.0)[:, None]
+
+    Z = sp.csr_matrix(
+        (
+            np.ones(ok.sum(), np.float32),
+            (np.flatnonzero(ok), codes[ok]),
+        ),
+        shape=(W.shape[0], K),
+    )
+
+    P = np.asarray((W.T @ Z).todense())
+
+    tot = P.sum(axis=1)
+
+    props = P / np.where(
+        tot > 0, tot, 1.0
+    )[:, None]
+
+    # --------------------------------------------------
+    # 2. Get MALDI pixel polygons
+    # --------------------------------------------------
 
     pix = _pixel_polys(sdata, adata)
-    cen = pix.centroid
-    xy = np.column_stack([cen.x.to_numpy(), cen.y.to_numpy()])
+
+    # --------------------------------------------------
+    # 3. Transform pixel polygons into requested
+    #    coordinate system
+    # --------------------------------------------------
+
+    # _pixel_polys() returns a GeoDataFrame.
+    # Its geometry needs a known source coordinate system.
+    #
+    # Here we assume it uses the same coordinates as
+    # sdata.shapes["pixels"].
+
+    source_pixels = sdata.shapes["pixels"]
+
+    pixel_transforms = get_transformation(
+        source_pixels,
+        get_all=True,
+    )
+
+
+    pixel_shapes = ShapesModel.parse(
+        gpd.GeoDataFrame(
+            geometry=pix.copy(),
+            crs=pix.crs,
+        ),
+        transformations=pixel_transforms,
+    )
+
+    pix = sd.transform(
+        pixel_shapes,
+        to_coordinate_system=coordinate_system,
+    )
+
+    # --------------------------------------------------
+    # 4. Calculate pie positions and radius
+    # --------------------------------------------------
+
+    cen = pix.geometry.centroid
+
+    xy = np.column_stack([
+        cen.x.to_numpy(),
+        cen.y.to_numpy(),
+    ])
+
     b = pix.bounds.to_numpy()
-    radius = 0.5 * np.median(np.minimum(b[:, 2] - b[:, 0], b[:, 3] - b[:, 1])) * radius_scale
+
+    radius = (
+        0.5
+        * np.median(
+            np.minimum(
+                b[:, 2] - b[:, 0],
+                b[:, 3] - b[:, 1],
+            )
+        )
+        * radius_scale
+    )
+
+    # --------------------------------------------------
+    # 5. Select pixels inside ROI
+    # --------------------------------------------------
 
     show = (tot > 0) & _in_roi(pix, roi)
-    if show.sum() > max_pixels:
-        warnings.warn(f"Drawing {int(show.sum()):,} pies will be slow and hard to read; consider roi=(xmin, ymin, xmax, ymax).")
 
-    wedges, fcs = [], []
-    for i in np.flatnonzero(show):
-        cum = 0.0
-        for k in np.flatnonzero(props[i] > 0):
-            wedges.append(Wedge(xy[i], radius, 360 * cum, 360 * (cum + props[i, k])))
-            fcs.append(cmap[cats[k]])
-            cum += props[i, k]
+    if show.sum() > max_pixels:
+        warnings.warn(
+            f"Drawing {int(show.sum()):,} pies will be slow. "
+            "Consider specifying an ROI."
+        )
+
+    # --------------------------------------------------
+    # 6. Create axes
+    # --------------------------------------------------
 
     if ax is None:
-        _, ax = plt.subplots(figsize=(7, 7))
-    ax.add_collection(PatchCollection(wedges, facecolors=fcs, edgecolors="none", linewidths=0))
-    _style_spatial(ax, roi, [pix[show]] if show.any() else [pix], invert_y)
-    ax.set_title(title or f"{color}: composition of each MALDI pixel (weight={weight})", fontsize=9)
+        _, ax = plt.subplots(figsize=(8, 8))
+
+    # --------------------------------------------------
+    # 7. Render background image
+    # --------------------------------------------------
+
+    if image_key is not None:
+
+        if image_key not in sdata.images:
+            raise KeyError(
+                f"Image '{image_key}' not found in sdata.images."
+            )
+
+        # Crop before rendering for high-resolution
+        # multiscale images.
+        if roi is not None:
+
+            xmin, ymin, xmax, ymax = roi
+
+            image_sdata = sd.bounding_box_query(
+                sdata,
+                axes=("x", "y"),
+                min_coordinate=[xmin, ymin],
+                max_coordinate=[xmax, ymax],
+                target_coordinate_system=coordinate_system,
+            )
+
+        else:
+            image_sdata = sdata
+
+        (
+            image_sdata.pl
+            .render_images(
+                image_key,
+                alpha=image_alpha,
+            )
+            .pl.show(
+                coordinate_system,
+                ax=ax,
+            )
+        )
+
+    # --------------------------------------------------
+    # 8. Build pie wedges
+    # --------------------------------------------------
+
+    wedges = []
+    fcs = []
+
+    for i in np.flatnonzero(show):
+
+        cum = 0.0
+
+        for k in np.flatnonzero(props[i] > 0):
+
+            fraction = props[i, k]
+
+            wedges.append(
+                Wedge(
+                    xy[i],
+                    radius,
+                    360 * cum,
+                    360 * (cum + fraction),
+                )
+            )
+
+            fcs.append(cmap[cats[k]])
+
+            cum += fraction
+
+    # --------------------------------------------------
+    # 9. Draw pies over the image
+    # --------------------------------------------------
+
+    ax.add_collection(
+        PatchCollection(
+            wedges,
+            facecolors=fcs,
+            edgecolors="none",
+            linewidths=0,
+            zorder=10,
+        )
+    )
+
+    # --------------------------------------------------
+    # 10. Axis styling
+    # --------------------------------------------------
+
+    _style_spatial(
+        ax,
+        roi,
+        [pix[show]] if show.any() else [pix],
+        invert_y,
+    )
+
+    # Ensure ROI remains fixed after rendering
+    if roi is not None:
+
+        xmin, ymin, xmax, ymax = roi
+
+        ax.set_xlim(xmin, xmax)
+
+        if invert_y:
+            ax.set_ylim(ymax, ymin)
+        else:
+            ax.set_ylim(ymin, ymax)
+
+    ax.set_aspect("equal")
+
+    ax.set_title(
+        title or (
+            f"{color}: MALDI pixel composition "
+            f"(weight={weight})"
+        ),
+        fontsize=10,
+    )
+
+    # --------------------------------------------------
+    # 11. Legend
+    # --------------------------------------------------
+
     if legend:
-        ax.legend(handles=[Patch(fc=cmap[c], label=str(c)) for c in cats], loc="upper left",
-                  bbox_to_anchor=(1.01, 1), frameon=False, fontsize=8, title=color,
-                  ncol=1 if K <= 18 else 2)
-    out = pd.DataFrame(props, index=np.asarray(adata.uns["pixel_ids"]).astype(str), columns=[str(c) for c in cats])
+
+        ax.legend(
+            handles=[
+                Patch(
+                    fc=cmap[c],
+                    label=str(c),
+                )
+                for c in cats
+            ],
+            loc="upper left",
+            bbox_to_anchor=(1.01, 1),
+            frameon=False,
+            fontsize=8,
+            title=color,
+            ncol=1 if K <= 18 else 2,
+        )
+
+    # --------------------------------------------------
+    # 12. Return proportions
+    # --------------------------------------------------
+
+    out = pd.DataFrame(
+        props,
+        index=np.asarray(
+            adata.uns["pixel_ids"]
+        ).astype(str),
+        columns=[str(c) for c in cats],
+    )
+
     return ax, out.loc[show]
 
 

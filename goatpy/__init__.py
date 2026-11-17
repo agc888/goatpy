@@ -11,7 +11,7 @@ from .preprocessing import normalize_spatialdata
 from .he_image import he_spatialdata, add_annotations
 from .annotation import annotations_to_pixels
 from .filter import filter_spatialdata
-from .tools import annotate_glycans, merge_spatialdata,spatial_autocorrelation
+from .tools import annotate_glycans, merge_spatialdata,spatial_autocorrelation, extract_channel_intensity
 from .bin import bin_and_align, bin_imzml
 from .plotting import check_batch, plot_spectrum, plot_spectra_comparison
 from .batch_correction import batch_correction
@@ -19,6 +19,7 @@ from .analysis_gui import launch_goatpy_gui
 from .sopa_segmentation import make_gp_image_patches, add_n_cells_per_pixel, add_pyramid, tissue_mask, add_fullres_to_sdata, pixels_to_cells
 from .calibration import calibrate_imzml_file
 from .deconvolution import deconvolve_maldi_to_cells, run_decon_PCA, compare_models, compare_morphology_clusters, plot_pixel_pies, evaluate_deconvolution, plot_model_comparison
+from .spatialdata_helper import save_element
 
 __all__ = [
     "Add_Pseudo_Image",
@@ -58,7 +59,9 @@ __all__ = [
     "compare_morphology_clusters",
     "plot_pixel_pies",
     "evaluate_deconvolution", 
-    "plot_model_comparison"
+    "plot_model_comparison",
+    "save_element",
+    "extract_channel_intensity"
 ]
 
 __version__ = "0.1.0"
