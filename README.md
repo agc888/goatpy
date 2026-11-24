@@ -19,6 +19,8 @@
 - **Pseudo-image generation** — create spatial images from categorical or continuous obs columns
 - **Landmark alignment GUI** — interactive napari-based landmark alignment tool
 - **SpatialData native** — all outputs are standard `SpatialData` objects, compatible with the scverse ecosystem
+- **Deconvolution** — analyse mixed signals in spatial glycomics data.
+- **Single-cell H&E analysis** — segment cells in H&E images with SOPA and StarDist, align cell boundaries with MALDI imaging data, and use `pixel_to_cells` to assign pixel-level measurements to overlapping cells for pseudo-single-cell analysis and clustering.
 
 ## Installation
 
